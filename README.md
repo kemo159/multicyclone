@@ -22,7 +22,6 @@ Special thanks to Jean-Luc Pons and the original CUDACyclone author for the foun
 - WSL2 build/runtime smoke testing.
 - CUDA 13.x-oriented architecture support, including Blackwell-era compute 12.x targets.
 - Portable host/device arithmetic fixes for MSVC compatibility.
-- Clean `.gitignore` and `.gitattributes` for source-only repository uploads.
 - Dedicated [BUILD.md](BUILD.md) with full dependency and build instructions.
 
 ## Features
@@ -260,3 +259,6 @@ MultiCyclone fork notes:
 - CMake build system.
 - Build/package documentation.
 
+Tips are highly recommended 
+Solana: AMt9VC3Zuq98V7rXfTZ3MRgv8DXGRadGeYBmNwbSa95s
+BTC: bc1q37vyyq7sjzkc3wx29c2ctgh7l25r5jy98xdkze
