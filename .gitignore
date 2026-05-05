@@ -1,0 +1,36 @@
+# Build directories
+build/
+build-*/
+cmake-build-*/
+
+# CUDA and native build outputs
+*.o
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.exe
+*.out
+/CUDACyclone
+
+# Generated packages and archives
+dist/
+*.zip
+*.tar
+*.tar.gz
+
+# Runtime output files
+found_key.txt
+partial.txt
+partialp*.txt
+cyclone_tests_results.txt
+
+# Editor and OS metadata
+.vscode/
+.idea/
+.vs/
+*.swp
+*~
+Thumbs.db
+.DS_Store
