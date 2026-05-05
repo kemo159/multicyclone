@@ -74,16 +74,7 @@ static inline void random_segment_start(uint64_t out[4],
     add256(range_start, rel, out);
 }
 
-static inline void advance_sweep_origin(uint64_t origin[4],
-                                        const uint64_t sweep_coverage[4],
-                                        const uint64_t range_start[4],
-                                        const uint64_t range_len[4]) {
-    uint64_t next[4];
-    random_segment_start(next, origin, sweep_coverage, range_start, range_len);
-    origin[0]=next[0]; origin[1]=next[1]; origin[2]=next[2]; origin[3]=next[3];
-}
-
-static inline void gen_random_256(uint64_t out[4], uint64_t lo[4], uint64_t hi[4]) {
+static inline void gen_random_256(uint64_t out[4], const uint64_t lo[4], const uint64_t hi[4]) {
     static thread_local std::mt19937_64 gen([]{
         std::random_device rd;
         std::seed_seq seq{
@@ -120,6 +111,17 @@ static inline void gen_random_256(uint64_t out[4], uint64_t lo[4], uint64_t hi[4
     } while (!lt256(offset, len));
 
     add256(lo, offset, out);
+}
+
+static inline void gen_new_random_sweep_origin(uint64_t origin[4],
+                                               const uint64_t range_start[4],
+                                               const uint64_t range_end[4]) {
+    uint64_t previous[4] = { origin[0], origin[1], origin[2], origin[3] };
+    bool can_change = !eq256_host(range_start, range_end);
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        gen_random_256(origin, range_start, range_end);
+        if (!can_change || !eq256_host(origin, previous)) return;
+    }
 }
 
 static volatile sig_atomic_t g_sigint = 0;
@@ -171,16 +173,6 @@ static inline std::string formatHash160Hex(const uint8_t hash160[20]) {
     oss << std::hex << std::setfill('0');
     for (int i = 0; i < 20; ++i) {
         oss << std::setw(2) << (unsigned int)hash160[i];
-    }
-    return oss.str();
-}
-
-static inline std::string formatCompressedPubHexFromPrefixX(uint8_t prefix, const uint64_t X[4]) {
-    std::ostringstream oss;
-    oss << std::hex << std::setfill('0') << std::nouppercase;
-    oss << std::setw(2) << (unsigned int)prefix;
-    for (int limb = 3; limb >= 0; --limb) {
-        oss << std::setw(16) << X[limb];
     }
     return oss.str();
 }
@@ -968,7 +960,7 @@ uint64_t total_threads_single = 0;
     uint64_t random_global_offset[4] = {0, 0, 0, 0};
     uint64_t random_sweep_coverage[4] = {0, 0, 0, 0};
     if (random_mode) {
-        gen_random_256(random_sweep_origin, range_start, range_end);
+        gen_new_random_sweep_origin(random_sweep_origin, range_start, range_end);
         for (int gpuIdx = 0; gpuIdx < numGPUs; ++gpuIdx) {
             uint64_t gpu_coverage[4];
             add256_u64_mul(gpus[gpuIdx].per_thread_cnt, gpus[gpuIdx].threadsTotal, gpu_coverage);
@@ -1123,10 +1115,6 @@ uint64_t total_threads_single = 0;
         cudaMemcpyToSymbol(c_target_hash160, target_hash160, 20);
     }
 
-    if (random_mode) {
-        advance_sweep_origin(random_sweep_origin, random_sweep_coverage, range_start, range_len);
-    }
-
     cudaSetDevice(gpus[0].deviceId);
     std::cout << "Single-GPU threads: " << total_threads_single << "\n";
     for (int gpuIdx = 0; gpuIdx < numGPUs; ++gpuIdx) {
@@ -1185,11 +1173,8 @@ uint64_t total_threads_single = 0;
         for (uint32_t i = 0; i < to_copy; ++i) {
             const PartialResult& r = partialHost[i];
             std::ofstream out(partialOutputFile(partial_digits, r.match_chars), std::ios::app);
-            out << "Match: " << r.match_chars << " hex chars\n";
-            out << "Hash160: " << formatHash160Hex(r.hash160) << "\n";
-            out << "Private Key: " << formatHex256(r.scalar) << "\n";
-            out << "Public Key: " << formatCompressedPubHexFromPrefixX(r.pubkey_prefix, r.X) << "\n";
-            out << "GPU: " << gpuIdx << "\n\n";
+            out << "Hex: " << formatHex256(r.scalar)
+                << " Hash160: " << formatHash160Hex(r.hash160) << "\n";
         }
 
         if (overflow != 0) {
@@ -1381,6 +1366,7 @@ uint64_t total_threads_single = 0;
                     last_random_time = elapsed_total;
                     std::cout << "\n[RANDOM MODE] Re-randomizing keys...\n";
 
+                    gen_new_random_sweep_origin(random_sweep_origin, range_start, range_end);
                     uint64_t global_offset[4] = {0, 0, 0, 0};
 
                     for (int gpuIdx = 0; gpuIdx < numGPUs; ++gpuIdx) {
@@ -1435,7 +1421,6 @@ uint64_t total_threads_single = 0;
                         gpuCompleted[gpuIdx] = false;
                         gpuNeedsLaunch[gpuIdx] = false;
                     }
-                    advance_sweep_origin(random_sweep_origin, random_sweep_coverage, range_start, range_len);
                     std::cout.flush();
                 }
             }
