@@ -29,8 +29,8 @@ class Timer {
 public:
   static void Init();
   static double get_tick();
-  static void printResult(char *unit, int nbTry, double t0, double t1);
-  static std::string getResult(char *unit, int nbTry, double t0, double t1);
+  static void printResult(const char *unit, int nbTry, double t0, double t1);
+  static std::string getResult(const char *unit, int nbTry, double t0, double t1);
   static int getCoreNumber();
   static std::string getSeed(int size);
   static uint32_t getSeed32();
