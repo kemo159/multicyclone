@@ -1,6 +1,6 @@
 # Build Instructions
 
-This project builds on native Windows and Linux with NVIDIA CUDA. CUDA Toolkit 13.x is recommended for current RTX 50-series and newer CUDA 13 architecture support.
+This project builds on native Windows and Linux with NVIDIA CUDA. CUDA Toolkit 13.x is recommended for current RTX 50-series and newer CUDA 13 architecture support. The main executable also embeds the AVX2 CPU worker used by `--cpu-auto`.
 
 ## Windows
 
@@ -12,6 +12,7 @@ Install:
 - CUDA Toolkit 13.x
 - Visual Studio 2022 Build Tools
 - CMake 3.24 or newer
+- AVX2-capable CPU
 
 When installing Visual Studio Build Tools, select:
 
@@ -51,6 +52,12 @@ Run a smoke test:
 .\build-msvc\Release\CUDACyclone.exe --help
 ```
 
+Hybrid CPU/GPU smoke test:
+
+```powershell
+.\build-msvc\Release\CUDACyclone.exe --range 200000000:2000003ff --address 17Dw58gss9JDWWjjsPtT8Tts6T3aeDTMhx --grid 128,8 --slices 1 --cpu-threads 1 --cpu-percent 25
+```
+
 ### Choosing CUDA Architectures
 
 Use the architecture that matches your GPU:
@@ -80,6 +87,7 @@ Install:
 - GCC/G++
 - Make
 - CMake, optional but recommended
+- AVX2/BMI2/ADX-capable CPU
 
 Ubuntu/Debian package basics:
 
@@ -127,6 +135,8 @@ Run a smoke test:
 ./CUDACyclone --help
 ```
 
+The Makefile builds the CUDA pipeline and the embedded AVX2 CPU worker into one binary.
+
 ### Build With CMake
 
 ```bash
@@ -140,6 +150,12 @@ The executable will be created at:
 build/CUDACyclone
 ```
 
+Run a hybrid CPU/GPU smoke test:
+
+```bash
+./build/CUDACyclone --range 200000000:2000003ff --address 17Dw58gss9JDWWjjsPtT8Tts6T3aeDTMhx --grid 128,8 --slices 1 --cpu-threads 1 --cpu-percent 25
+```
+
 ## WSL2 Notes
 
 For WSL2 on Windows:
@@ -148,6 +164,7 @@ For WSL2 on Windows:
 - Install Ubuntu from the Microsoft Store.
 - Install the Linux CUDA Toolkit inside WSL.
 - Build using the Linux instructions above.
+- `--cpu-auto` works in WSL as long as the binary can relaunch itself and write `cpu_worker.log`/`cpu_worker.stats` in the current directory.
 
 Verify GPU visibility inside WSL:
 
@@ -178,3 +195,4 @@ Windows CMake build:
 Remove-Item -Recurse -Force build-msvc
 ```
 
+Runtime files such as `found_key.txt`, `found_keys.txt`, `cpu_worker.log`, and `cpu_worker.stats` can be deleted between benchmark or smoke-test runs.

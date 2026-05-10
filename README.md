@@ -1,6 +1,6 @@
-# MultiCyclone
+# MultiCyclone v2.5
 
-MultiCyclone is a fork of CUDACyclone, a CUDA-based GPU Satoshi puzzle solver. This fork keeps the original high-throughput secp256k1 and Hash160 search pipeline, and adds native Windows build support, Linux/WSL build verification, CUDA 13.x architecture updates, and cleaner packaging/build documentation.
+MultiCyclone is a fork of CUDACyclone, a CUDA-based GPU Satoshi puzzle solver. This fork keeps the original high-throughput secp256k1 and Hash160 search pipeline, and adds an embedded AVX2 CPU sidecar, native Windows build support, Linux/WSL build verification, CUDA 13.x architecture updates, and cleaner packaging/build documentation.
 
 This software is intended for legitimate puzzle, research, and recovery workflows where you are authorized to search the key range.
 
@@ -20,8 +20,10 @@ Special thanks to Jean-Luc Pons and the original CUDACyclone author for the foun
 - Native Windows build support with Visual Studio 2022, CMake, and CUDA.
 - Linux build support through the existing Makefile and new CMake configuration.
 - WSL2 build/runtime smoke testing.
+- Embedded AVX2 CPU worker in the same executable, with automatic CPU/GPU range split.
 - CUDA 13.x-oriented architecture support, including Blackwell-era compute 12.x targets.
 - Portable host/device arithmetic fixes for MSVC compatibility.
+- Launch guard for very large grids, preserving thread count while shortening kernel launches.
 - Dedicated [BUILD.md](BUILD.md) with full dependency and build instructions.
 
 ## Features
@@ -31,6 +33,8 @@ Special thanks to Jean-Luc Pons and the original CUDACyclone author for the foun
 - Batch elliptic-curve operations and modular inversion.
 - Configurable grid and batch sizing with `--grid`.
 - Kernel slicing with `--slices` for better long-run behavior on high-end GPUs.
+- Optional hybrid GPU + AVX2 CPU search with live CPU stats.
+- Automatic CPU/GPU benchmark split with `--cpu-auto`.
 - Multi-GPU selection with `--gpus`.
 - Direct P2PKH address target or raw Hash160 target.
 - Partial Hash160 prefix candidate logging with `--partial`.
@@ -49,6 +53,7 @@ Windows:
 - Visual Studio 2022 Build Tools with the C++ workload.
 - CMake 3.24 or newer.
 - CUDA Toolkit 13.x.
+- AVX2-capable CPU for the embedded CPU worker.
 
 Linux:
 
@@ -56,6 +61,7 @@ Linux:
 - Make.
 - CMake, optional but recommended.
 - CUDA Toolkit 13.x.
+- AVX2/BMI2/ADX-capable CPU for the embedded CPU worker.
 
 See [BUILD.md](BUILD.md) for full package installation notes.
 
@@ -144,6 +150,11 @@ Windows:
 - `--grid A,B`: Tuning parameter. `A` is points per thread batch, `B` is threads per batch/group.
 - `--slices N`: Number of batches per thread per kernel launch.
 - `--gpus GPU1,GPU2,...`: Select GPU IDs to use.
+- `--cpu-threads N|auto`: Enable the embedded AVX2 CPU sidecar using `N` threads, or all CPU threads minus one with `auto`.
+- `--cpu-percent P|auto`: Give the CPU sidecar `P` percent of the tail of the range. With `auto`, benchmark CPU and GPU first.
+- `--cpu-auto`: Shortcut for automatic CPU thread count and automatic CPU/GPU split.
+- `--cpu-bench-seconds N`: Benchmark duration used by `--cpu-auto`.
+- `--max-launch-keys N`: Cap keys per kernel launch. This prevents very large grids from causing long/hung launches.
 - `--random-interval SECONDS`: Re-randomize search segments periodically.
 - `--partial HEX_DIGITS`: Save candidates whose Hash160 begins with the requested number of target hex digits.
 
@@ -155,15 +166,24 @@ Example:
 
 With `--partial 6`, a 6-hex-character Hash160 prefix match is saved to `partial.txt`. Longer matches are saved to `partialpN.txt`, where `N` is the number of extra matching hex digits.
 
-## Tuning Notes
-
-The original project notes that very large batches can reduce speed on some GPUs. For RTX 4090-class hardware, a commonly reported stable configuration is:
+Hybrid CPU/GPU example:
 
 ```bash
-./CUDACyclone --range <start:end> --address <address> --grid 128,128 --slices 16
+./CUDACyclone --range <start:end> --address <address> --grid 512,512 --slices 64 --cpu-auto
 ```
 
-Good values are GPU-dependent. Start with the examples in this README, watch VRAM usage and speed, then adjust `--grid` and `--slices`.
+`--cpu-auto` runs a short CPU benchmark and a short GPU benchmark, then gives the CPU a matching tail percentage so both workers finish close together. The CPU worker is launched from the same executable; there is no separate CPU exe to manage.
+
+## Tuning Notes
+
+The original project notes that very large batches can reduce speed on some GPUs. Large modern GPUs often prefer much larger grids than the old defaults. Useful starting points are:
+
+```bash
+./CUDACyclone --range <start:end> --address <address> --grid 512,512 --slices 64
+./CUDACyclone --range <start:end> --address <address> --grid 1024,1024 --slices 64
+```
+
+Good values are GPU-dependent. Start with the examples in this README, watch count/time over longer runs, then adjust `--grid` and `--slices`. If a very large launch would run too long, the launch guard reduces slices per launch instead of shrinking the configured thread count.
 
 ## Proof Script
 
@@ -239,6 +259,8 @@ Generated binaries and build folders are intentionally ignored by git:
 - `dist/`
 - `*.o`, `*.obj`, `*.exe`
 - root-level `CUDACyclone`
+- root-level `CUDACyclone_wsl`
+- runtime logs and proof/range output files
 
 To package a release, build fresh binaries for the target platforms and place them in a release archive outside the tracked source files.
 
@@ -253,6 +275,7 @@ Original CUDACyclone notes:
 
 MultiCyclone fork notes:
 
+- `v2.5`: Embedded AVX2 CPU worker, `--cpu-auto` benchmark split, Windows/Linux sidecar process support, launch guard improvements, WSL verification, and refreshed docs.
 - Native Windows + Linux build support.
 - CUDA 13.x architecture updates.
 - MSVC-compatible arithmetic changes.

@@ -36,5 +36,3 @@ __device__ __constant__ uint64_t Gy_d[4];
     std::cerr << "CUDA Error: " << cudaGetErrorString(err) << " at " << __FILE__ << ":" << __LINE__ << std::endl; exit(EXIT_FAILURE); } } while(0)
 
 
-
-

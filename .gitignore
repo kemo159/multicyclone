@@ -13,6 +13,7 @@ cmake-build-*/
 *.exe
 *.out
 /CUDACyclone
+/CUDACyclone_wsl
 
 # Generated packages and archives
 dist/
@@ -22,9 +23,16 @@ dist/
 
 # Runtime output files
 found_key.txt
+found_keys.txt
+cpu_worker.log
+cpu_worker.stats
 partial.txt
 partialp*.txt
 cyclone_tests_results.txt
+computed.txt
+proof.txt
+missing_ranges*.txt
+duplicate_ranges*.txt
 
 # Editor and OS metadata
 .vscode/

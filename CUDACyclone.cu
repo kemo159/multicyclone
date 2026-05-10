@@ -21,12 +21,26 @@
 #include <atomic>
 #include <random>
 #include <algorithm>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #include "CUDAMath.h"
 #include "sha256.h"
 #include "CUDAHash.cuh"
 #include "CUDAUtils.h"
 #include "CUDAStructures.h"
+
+extern int cpu_avx2_worker_main(int argc, char* argv[]);
 
 static inline bool lt256(const uint64_t a[4], const uint64_t b[4]) {
     for (int i = 3; i >= 0; --i) {
@@ -51,6 +65,13 @@ static inline bool is_zero_256_host(const uint64_t a[4]) {
 
 static inline bool eq256_host(const uint64_t a[4], const uint64_t b[4]) {
     return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
+}
+
+static inline void copy256_host(const uint64_t src[4], uint64_t dst[4]) {
+    dst[0] = src[0];
+    dst[1] = src[1];
+    dst[2] = src[2];
+    dst[3] = src[3];
 }
 
 static inline void wrap_mod_range(uint64_t value[4], const uint64_t range_len[4]) {
@@ -138,6 +159,454 @@ static inline bool cuda_check(cudaError_t e, const char* msg) {
 }
 #define ck(e, msg) cuda_check(e, msg)
 
+static inline uint64_t file_size_or_zero(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) return 0ull;
+    std::streampos p = f.tellg();
+    return p > 0 ? (uint64_t)p : 0ull;
+}
+
+static inline std::string quote_win_arg(const std::string& s) {
+#if defined(_WIN32)
+    std::string out = "\"";
+    for (char c : s) {
+        if (c == '"') out += "\\\"";
+        else out += c;
+    }
+    out += "\"";
+    return out;
+#else
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') out += "'\\''";
+        else out += c;
+    }
+    out += "'";
+    return out;
+#endif
+}
+
+static std::string default_self_exe_path(const char* argv0) {
+#if defined(_WIN32)
+    char path[4096];
+    DWORD n = GetModuleFileNameA(NULL, path, (DWORD)sizeof(path));
+    if (n > 0 && n < sizeof(path)) return std::string(path, path + n);
+#else
+    char path[4096];
+    ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (n > 0) {
+        path[n] = '\0';
+        return std::string(path);
+    }
+#endif
+    return (argv0 != nullptr && argv0[0] != '\0') ? std::string(argv0) : std::string();
+}
+
+static std::string run_command_capture(const std::string& cmd)
+{
+#if defined(_WIN32)
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = NULL;
+
+    HANDLE read_pipe = NULL;
+    HANDLE write_pipe = NULL;
+    if (!CreatePipe(&read_pipe, &write_pipe, &sa, 0)) return "";
+    SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = write_pipe;
+    si.hStdError = write_pipe;
+
+    PROCESS_INFORMATION pi{};
+    std::vector<char> mutable_cmd(cmd.begin(), cmd.end());
+    mutable_cmd.push_back('\0');
+
+    BOOL ok = CreateProcessA(NULL, mutable_cmd.data(), NULL, NULL, TRUE,
+                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    CloseHandle(write_pipe);
+    if (!ok) {
+        CloseHandle(read_pipe);
+        return "";
+    }
+
+    std::string out;
+    char buf[4096];
+    DWORD bytes_read = 0;
+    while (ReadFile(read_pipe, buf, sizeof(buf), &bytes_read, NULL) && bytes_read != 0) {
+        out.append(buf, buf + bytes_read);
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    CloseHandle(read_pipe);
+    return out;
+#else
+    std::string full_cmd = cmd + " 2>&1";
+    FILE* pipe = popen(full_cmd.c_str(), "r");
+    if (!pipe) return "";
+
+    std::string out;
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), pipe) != nullptr) {
+        out += buf;
+    }
+    pclose(pipe);
+    return out;
+#endif
+}
+
+static double parse_last_number_after_marker(const std::string& text, const std::string& marker)
+{
+    double last = 0.0;
+    bool found = false;
+    size_t pos = 0;
+    while ((pos = text.find(marker, pos)) != std::string::npos) {
+        const char* begin = text.c_str() + pos + marker.size();
+        char* end = nullptr;
+        double value = std::strtod(begin, &end);
+        if (end != begin) {
+            last = value;
+            found = true;
+        }
+        pos += marker.size();
+    }
+    return found ? last : 0.0;
+}
+
+static std::string output_tail(const std::string& text, size_t max_chars = 2000)
+{
+    if (text.size() <= max_chars) return text;
+    return text.substr(text.size() - max_chars);
+}
+
+static uint32_t auto_cpu_threads_all_but_one()
+{
+    unsigned int hw = std::thread::hardware_concurrency();
+    if (hw <= 1u) return 1u;
+    return (uint32_t)(hw - 1u);
+}
+
+static bool benchmark_cpu_worker(const std::string& exe_path,
+                                 const std::string& address,
+                                 const std::string& range_arg,
+                                 uint32_t threads,
+                                 uint32_t seconds,
+                                 double& mkeys)
+{
+    std::string cmd = quote_win_arg(exe_path) +
+                      " --cpu-worker" +
+                      " -a " + quote_win_arg(address) +
+                      " -r " + quote_win_arg(range_arg) +
+                      " -t " + std::to_string(threads) +
+                      " --bench-seconds " + std::to_string(seconds) +
+                      " --quiet";
+    std::string out = run_command_capture(cmd);
+    mkeys = parse_last_number_after_marker(out, "CPU_BENCH_MKEYS=");
+    if (mkeys <= 0.0) {
+        std::cerr << "Error: CPU benchmark did not report a usable speed.\n"
+                  << output_tail(out) << "\n";
+        return false;
+    }
+    return true;
+}
+
+static bool benchmark_gpu_self(const std::string& exe_path,
+                               const std::string& range_arg,
+                               const std::string& gpu_list,
+                               uint32_t grid_a,
+                               uint32_t grid_b,
+                               uint32_t slices,
+                               uint32_t threads_per_block,
+                               uint64_t max_launch_keys,
+                               uint32_t seconds,
+                               double& mkeys)
+{
+    static const char* dummy_hash160 = "ffffffffffffffffffffffffffffffffffffffff";
+    std::string cmd = quote_win_arg(exe_path) +
+                      " --range " + quote_win_arg(range_arg) +
+                      " --target-hash160 " + dummy_hash160 +
+                      " --grid " + std::to_string(grid_a) + "," + std::to_string(grid_b) +
+                      " --slices " + std::to_string(slices) +
+                      " --tpb " + std::to_string(threads_per_block) +
+                      " --max-launch-keys " + std::to_string(max_launch_keys) +
+                      " --seconds " + std::to_string(seconds);
+    if (!gpu_list.empty()) {
+        cmd += " --gpus " + quote_win_arg(gpu_list);
+    }
+
+    std::string out = run_command_capture(cmd);
+    mkeys = parse_last_number_after_marker(out, "Speed:");
+    if (mkeys <= 0.0) {
+        std::cerr << "Error: GPU benchmark did not report a usable speed.\n"
+                  << output_tail(out) << "\n";
+        return false;
+    }
+    return true;
+}
+
+struct CpuSidecar {
+    bool active = false;
+    bool done = false;
+    uint64_t initial_found_size = 0ull;
+    std::string log_path = "cpu_worker.log";
+    std::string stats_path = "cpu_worker.stats";
+#if defined(_WIN32)
+    PROCESS_INFORMATION pi{};
+#else
+    pid_t pid = -1;
+#endif
+};
+
+static bool launch_cpu_sidecar(CpuSidecar& cpu,
+                               const std::string& exe_path,
+                               const std::string& address,
+                               const std::string& range_arg,
+                               uint32_t threads)
+{
+#if defined(_WIN32)
+    cpu.initial_found_size = file_size_or_zero("found_keys.txt");
+    std::remove(cpu.stats_path.c_str());
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE hLog = CreateFileA(cpu.log_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                              &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hLog == INVALID_HANDLE_VALUE) {
+        std::cerr << "Error: cannot open " << cpu.log_path << " for CPU worker output.\n";
+        return false;
+    }
+
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = hLog;
+    si.hStdError = hLog;
+
+    std::string cmd = quote_win_arg(exe_path) +
+                      " --cpu-worker -a " + quote_win_arg(address) +
+                      " -r " + quote_win_arg(range_arg) +
+                      " -t " + std::to_string(threads) +
+                      " --stats-file " + quote_win_arg(cpu.stats_path) +
+                      " --quiet";
+    std::vector<char> mutable_cmd(cmd.begin(), cmd.end());
+    mutable_cmd.push_back('\0');
+
+    BOOL ok = CreateProcessA(NULL, mutable_cmd.data(), NULL, NULL, TRUE,
+                             CREATE_NO_WINDOW, NULL, NULL, &si, &cpu.pi);
+    CloseHandle(hLog);
+    if (!ok) {
+        std::cerr << "Error: failed to launch CPU worker: " << exe_path
+                  << " (GetLastError=" << GetLastError() << ")\n";
+        return false;
+    }
+    cpu.active = true;
+    cpu.done = false;
+    return true;
+#else
+    cpu.initial_found_size = file_size_or_zero("found_keys.txt");
+    std::remove(cpu.stats_path.c_str());
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        std::cerr << "Error: failed to fork CPU worker: " << std::strerror(errno) << "\n";
+        return false;
+    }
+
+    if (pid == 0) {
+        int fd = open(cpu.log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            dup2(fd, STDOUT_FILENO);
+            dup2(fd, STDERR_FILENO);
+            close(fd);
+        }
+
+        int nullfd = open("/dev/null", O_RDONLY);
+        if (nullfd >= 0) {
+            dup2(nullfd, STDIN_FILENO);
+            close(nullfd);
+        }
+
+        std::vector<std::string> args;
+        args.push_back(exe_path);
+        args.push_back("--cpu-worker");
+        args.push_back("-a");
+        args.push_back(address);
+        args.push_back("-r");
+        args.push_back(range_arg);
+        args.push_back("-t");
+        args.push_back(std::to_string(threads));
+        args.push_back("--stats-file");
+        args.push_back(cpu.stats_path);
+        args.push_back("--quiet");
+
+        std::vector<char*> argv_exec;
+        argv_exec.reserve(args.size() + 1);
+        for (std::string& arg : args) {
+            argv_exec.push_back(arg.data());
+        }
+        argv_exec.push_back(nullptr);
+
+        execvp(argv_exec[0], argv_exec.data());
+        std::cerr << "Error: failed to exec CPU worker: " << exe_path
+                  << " (" << std::strerror(errno) << ")\n";
+        _exit(127);
+    }
+
+    cpu.pid = pid;
+    cpu.active = true;
+    cpu.done = false;
+    return true;
+#endif
+}
+
+static bool poll_cpu_sidecar(CpuSidecar& cpu, bool& found)
+{
+    found = false;
+#if defined(_WIN32)
+    if (!cpu.active) return false;
+    DWORD wait = WaitForSingleObject(cpu.pi.hProcess, 0);
+    if (wait == WAIT_TIMEOUT) return true;
+
+    CloseHandle(cpu.pi.hThread);
+    CloseHandle(cpu.pi.hProcess);
+    cpu.active = false;
+    cpu.done = true;
+    found = file_size_or_zero("found_keys.txt") > cpu.initial_found_size;
+    return false;
+#else
+    if (!cpu.active) return false;
+
+    int status = 0;
+    pid_t r = waitpid(cpu.pid, &status, WNOHANG);
+    if (r == 0) return true;
+
+    if (r == cpu.pid || (r < 0 && errno == ECHILD)) {
+        cpu.active = false;
+        cpu.done = true;
+        found = file_size_or_zero("found_keys.txt") > cpu.initial_found_size;
+        return false;
+    }
+
+    if (r < 0) {
+        std::cerr << "Warning: CPU worker waitpid failed: " << std::strerror(errno) << "\n";
+        cpu.active = false;
+        cpu.done = true;
+    }
+    return false;
+#endif
+}
+
+static void terminate_cpu_sidecar(CpuSidecar& cpu)
+{
+#if defined(_WIN32)
+    if (!cpu.active) return;
+    TerminateProcess(cpu.pi.hProcess, 130);
+    WaitForSingleObject(cpu.pi.hProcess, 5000);
+    CloseHandle(cpu.pi.hThread);
+    CloseHandle(cpu.pi.hProcess);
+    cpu.active = false;
+    cpu.done = true;
+#else
+    if (!cpu.active) return;
+
+    kill(cpu.pid, SIGTERM);
+    int status = 0;
+    for (int i = 0; i < 50; ++i) {
+        pid_t r = waitpid(cpu.pid, &status, WNOHANG);
+        if (r == cpu.pid || (r < 0 && errno == ECHILD)) {
+            cpu.active = false;
+            cpu.done = true;
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    kill(cpu.pid, SIGKILL);
+    waitpid(cpu.pid, &status, 0);
+    cpu.active = false;
+    cpu.done = true;
+#endif
+}
+
+static bool write_cpu_found_summary_from_file()
+{
+    std::ifstream in("found_keys.txt");
+    if (!in) return false;
+
+    std::string line;
+    std::string last;
+    while (std::getline(in, line)) {
+        if (!line.empty()) last = line;
+    }
+    if (last.empty()) return false;
+
+    std::istringstream iss(last);
+    std::string priv, pub, wif, address;
+    if (!(iss >> priv >> pub >> wif >> address)) return false;
+
+    std::ofstream out("found_key.txt");
+    if (!out) return false;
+    out << "Private Key: " << priv << "\n";
+    out << "Public Key: " << pub << "\n";
+    out << "WIF: " << wif << "\n";
+    out << "Address: " << address << "\n";
+    out << "Backend: CPU AVX2\n";
+    return true;
+}
+
+struct CpuLiveStats {
+    bool valid = false;
+    uint32_t threads = 0;
+    double mkeys = 0.0;
+    unsigned long long checked = 0ull;
+    double elapsed = 0.0;
+    double progress = 0.0;
+    bool done = false;
+    bool found = false;
+};
+
+static bool read_cpu_live_stats(const std::string& path, CpuLiveStats& stats)
+{
+    std::ifstream in(path);
+    if (!in) return false;
+
+    CpuLiveStats s;
+    std::string line;
+    while (std::getline(in, line)) {
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = line.substr(0, eq);
+        std::string value = line.substr(eq + 1);
+        if (key == "CPU_THREADS") {
+            s.threads = (uint32_t)std::strtoul(value.c_str(), nullptr, 10);
+        } else if (key == "CPU_MKEYS") {
+            s.mkeys = std::strtod(value.c_str(), nullptr);
+        } else if (key == "CPU_CHECKED") {
+            s.checked = (unsigned long long)std::strtoull(value.c_str(), nullptr, 10);
+        } else if (key == "CPU_ELAPSED") {
+            s.elapsed = std::strtod(value.c_str(), nullptr);
+        } else if (key == "CPU_PROGRESS") {
+            s.progress = std::strtod(value.c_str(), nullptr);
+        } else if (key == "CPU_DONE") {
+            s.done = std::strtoul(value.c_str(), nullptr, 10) != 0;
+        } else if (key == "CPU_FOUND") {
+            s.found = std::strtoul(value.c_str(), nullptr, 10) != 0;
+        }
+    }
+
+    s.valid = s.threads != 0 || s.mkeys > 0.0 || s.checked != 0ull;
+    if (!s.valid) return false;
+    stats = s;
+    return true;
+}
+
 struct GPUContext {
     int deviceId;
     cudaDeviceProp prop;
@@ -164,6 +633,8 @@ struct GPUContext {
     uint64_t range_len[4];
     uint64_t launchesCompleted;
     uint64_t* d_current_scalar;
+    uint64_t* h_start_scalars;
+    uint64_t* h_counts256;
 };
 
 static constexpr uint32_t PARTIAL_RESULT_CAPACITY = 65536u;
@@ -251,13 +722,50 @@ __device__ __forceinline__ void record_partial_result(
 #ifndef WARP_SIZE
 #define WARP_SIZE 32
 #endif
+#ifndef KERNEL_MIN_BLOCKS
+#define KERNEL_MIN_BLOCKS 2
+#endif
+#ifndef KERNEL_MAX_THREADS
+#define KERNEL_MAX_THREADS 256
+#endif
+#ifndef ECC_ONLY_BENCH
+#define ECC_ONLY_BENCH 0
+#endif
+#ifndef HASH_DIAG_MODE
+#define HASH_DIAG_MODE 0
+#endif
+
+__device__ __forceinline__ uint32_t hash_diag_probe(uint8_t prefix, const uint64_t x[4])
+{
+#if HASH_DIAG_MODE == 1
+    return SHA256_33_diag_from_limbs(prefix, x);
+#elif HASH_DIAG_MODE == 2
+    (void)prefix;
+    return RIPEMD160_diag_from_limbs(x);
+#else
+    (void)prefix;
+    (void)x;
+    return 0u;
+#endif
+}
+
+__device__ unsigned int d_hash_diag_sink;
+
+__device__ __forceinline__ void consume_hash_diag(uint32_t v)
+{
+    if ((v & 0x00ffffffu) == 0x00f00d00u) {
+        atomicAdd(&d_hash_diag_sink, v);
+    }
+}
 
 __constant__ uint64_t c_Gx[(MAX_BATCH_SIZE/2) * 4];
 __constant__ uint64_t c_Gy[(MAX_BATCH_SIZE/2) * 4];
+__constant__ uint64_t c_Gny[(MAX_BATCH_SIZE/2) * 4];
 __constant__ uint64_t c_Jx[4];
 __constant__ uint64_t c_Jy[4];
 
-__launch_bounds__(256, 2)
+template <int B, bool EnablePartial>
+__launch_bounds__(KERNEL_MAX_THREADS, KERNEL_MIN_BLOCKS)
 __global__ void kernel_point_add_and_check_oneinv(
     const uint64_t* __restrict__ Px,
     const uint64_t* __restrict__ Py,
@@ -266,7 +774,6 @@ __global__ void kernel_point_add_and_check_oneinv(
     uint64_t* __restrict__ start_scalars,
     uint64_t* __restrict__ counts256,
     uint64_t threadsTotal,
-    uint32_t batch_size,
     uint32_t max_batches_per_launch,
     int* __restrict__ d_found_flag,
     FoundResult* __restrict__ d_found_result,
@@ -279,9 +786,9 @@ __global__ void kernel_point_add_and_check_oneinv(
     unsigned int* __restrict__ d_any_left
 )
 {
-    const int B = (int)batch_size;
-    if (B <= 0 || (B & 1) || B > MAX_BATCH_SIZE) return;
-    const int half = B >> 1;
+    static_assert(B > 0 && (B & 1) == 0 && B <= MAX_BATCH_SIZE,
+                  "B must be an even compile-time batch size within MAX_BATCH_SIZE");
+    constexpr int half = B >> 1;
 
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= threadsTotal) return;
@@ -325,14 +832,23 @@ __global__ void kernel_point_add_and_check_oneinv(
         if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
         {
-            uint8_t h20[20];
             uint8_t prefix = (uint8_t)(y1[0] & 1ULL) ? 0x03 : 0x02;
-            getHash160_33_from_limbs(prefix, x1, h20);
+#if ECC_ONLY_BENCH
+            (void)prefix;
             ++local_hashes; MAYBE_WARP_FLUSH();
-            record_partial_result(partial_chars, h20, S, x1, prefix, gid,
-                                  d_partial_results, d_partial_count,
-                                  d_partial_overflow, partial_capacity);
-
+#elif HASH_DIAG_MODE != 0
+            consume_hash_diag(hash_diag_probe(prefix, x1));
+            ++local_hashes;
+            MAYBE_WARP_FLUSH();
+#else
+            uint8_t h20[20];
+            getHash160_33_from_limbs(prefix, x1, h20);
+            if constexpr (EnablePartial) {
+                record_partial_result(partial_chars, h20, S, x1, prefix, gid,
+                                      d_partial_results, d_partial_count,
+                                      d_partial_overflow, partial_capacity);
+            }
+            ++local_hashes; MAYBE_WARP_FLUSH();
             bool full = hash160_prefix_equals(h20, target_prefix) &&
                         hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix);
             if (__any_sync(full_mask, full)) {
@@ -352,9 +868,10 @@ __global__ void kernel_point_add_and_check_oneinv(
                 }
                 __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
             }
+#endif
         }
 
-        uint64_t subp[MAX_BATCH_SIZE/2][4];
+        uint64_t subp[half][4];
         uint64_t acc[4], tmp[4];
 
 #pragma unroll
@@ -387,8 +904,6 @@ __global__ void kernel_point_add_and_check_oneinv(
         ModNeg256(sx_neg, x1);
 
         for (int i = 0; i < half - 1; ++i) {
-            if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
-
             uint64_t dx_inv_i[4];
             _ModMult(dx_inv_i, subp[i], inverse);
 
@@ -405,19 +920,29 @@ __global__ void kernel_point_add_and_check_oneinv(
                 ModSub256(px3, px3, x1);
                 ModSub256(px3, px3, px_i);
 
-                ModSub256(s, x1, px3); 
+                ModSub256(s, x1, px3);
                 _ModMult(s, s, lam);
                 uint8_t odd; ModSub256isOdd(s, y1, &odd);
 
-                uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
+                const uint8_t prefix3 = odd ? 0x03 : 0x02;
+#if ECC_ONLY_BENCH
+                (void)prefix3;
                 ++local_hashes; MAYBE_WARP_FLUSH();
-                uint64_t fs_partial[4]; for (int k=0;k<4;++k) fs_partial[k]=S[k];
-                uint64_t addv_partial=(uint64_t)(i+1);
-                for (int k=0;k<4 && addv_partial;++k){ uint64_t old=fs_partial[k]; fs_partial[k]=old+addv_partial; addv_partial=(fs_partial[k]<old)?1ull:0ull; }
-                record_partial_result(partial_chars, h20, fs_partial, px3, odd?0x03:0x02, gid,
-                                      d_partial_results, d_partial_count,
-                                      d_partial_overflow, partial_capacity);
-
+#elif HASH_DIAG_MODE != 0
+                consume_hash_diag(hash_diag_probe(prefix3, px3));
+                ++local_hashes;
+                MAYBE_WARP_FLUSH();
+#else
+                uint8_t h20[20]; getHash160_33_from_limbs(prefix3, px3, h20);
+                if constexpr (EnablePartial) {
+                    uint64_t fs_partial[4]; for (int k=0;k<4;++k) fs_partial[k]=S[k];
+                    uint64_t addv_partial=(uint64_t)(i+1);
+                    for (int k=0;k<4 && addv_partial;++k){ uint64_t old=fs_partial[k]; fs_partial[k]=old+addv_partial; addv_partial=(fs_partial[k]<old)?1ull:0ull; }
+                    record_partial_result(partial_chars, h20, fs_partial, px3, prefix3, gid,
+                                          d_partial_results, d_partial_count,
+                                          d_partial_overflow, partial_capacity);
+                }
+                ++local_hashes; MAYBE_WARP_FLUSH();
                 bool full = hash160_prefix_equals(h20, target_prefix) &&
                             hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix);
                 if (__any_sync(full_mask, full)) {
@@ -442,14 +967,14 @@ __global__ void kernel_point_add_and_check_oneinv(
                     }
                     __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
                 }
+#endif
             }
 
             {
                 uint64_t px3[4], s[4], lam[4];
                 uint64_t px_i[4], py_i[4];
 #pragma unroll
-                for (int j=0;j<4;++j) { px_i[j]=c_Gx[(size_t)i*4+j]; py_i[j]=c_Gy[(size_t)i*4+j]; }
-                ModNeg256(py_i, py_i); 
+                for (int j=0;j<4;++j) { px_i[j]=c_Gx[(size_t)i*4+j]; py_i[j]=c_Gny[(size_t)i*4+j]; }
 
                 ModSub256(s, py_i, y1);
                 _ModMult(lam, s, dx_inv_i);
@@ -462,15 +987,25 @@ __global__ void kernel_point_add_and_check_oneinv(
                 _ModMult(s, s, lam);
                 uint8_t odd; ModSub256isOdd(s, y1, &odd);
 
-                uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
+                const uint8_t prefix3 = odd ? 0x03 : 0x02;
+#if ECC_ONLY_BENCH
+                (void)prefix3;
                 ++local_hashes; MAYBE_WARP_FLUSH();
-                uint64_t fs_partial[4]; for (int k=0;k<4;++k) fs_partial[k]=S[k];
-                uint64_t sub_partial=(uint64_t)(i+1);
-                for (int k=0;k<4 && sub_partial;++k){ uint64_t old=fs_partial[k]; fs_partial[k]=old-sub_partial; sub_partial=(old<sub_partial)?1ull:0ull; }
-                record_partial_result(partial_chars, h20, fs_partial, px3, odd?0x03:0x02, gid,
-                                      d_partial_results, d_partial_count,
-                                      d_partial_overflow, partial_capacity);
-
+#elif HASH_DIAG_MODE != 0
+                consume_hash_diag(hash_diag_probe(prefix3, px3));
+                ++local_hashes;
+                MAYBE_WARP_FLUSH();
+#else
+                uint8_t h20[20]; getHash160_33_from_limbs(prefix3, px3, h20);
+                if constexpr (EnablePartial) {
+                    uint64_t fs_partial[4]; for (int k=0;k<4;++k) fs_partial[k]=S[k];
+                    uint64_t sub_partial=(uint64_t)(i+1);
+                    for (int k=0;k<4 && sub_partial;++k){ uint64_t old=fs_partial[k]; fs_partial[k]=old-sub_partial; sub_partial=(old<sub_partial)?1ull:0ull; }
+                    record_partial_result(partial_chars, h20, fs_partial, px3, prefix3, gid,
+                                          d_partial_results, d_partial_count,
+                                          d_partial_overflow, partial_capacity);
+                }
+                ++local_hashes; MAYBE_WARP_FLUSH();
                 bool full = hash160_prefix_equals(h20, target_prefix) &&
                             hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix);
                 if (__any_sync(full_mask, full)) {
@@ -494,6 +1029,7 @@ __global__ void kernel_point_add_and_check_oneinv(
                     }
                     __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
                 }
+#endif
             }
 
             uint64_t gxmi[4];
@@ -511,8 +1047,7 @@ __global__ void kernel_point_add_and_check_oneinv(
             uint64_t px3[4], s[4], lam[4];
             uint64_t px_i[4], py_i[4];
 #pragma unroll
-            for (int j=0;j<4;++j) { px_i[j]=c_Gx[(size_t)i*4+j]; py_i[j]=c_Gy[(size_t)i*4+j]; }
-            ModNeg256(py_i, py_i);
+            for (int j=0;j<4;++j) { px_i[j]=c_Gx[(size_t)i*4+j]; py_i[j]=c_Gny[(size_t)i*4+j]; }
 
             ModSub256(s, py_i, y1);
             _ModMult(lam, s, dx_inv_i);
@@ -525,15 +1060,25 @@ __global__ void kernel_point_add_and_check_oneinv(
             _ModMult(s, s, lam);
             uint8_t odd; ModSub256isOdd(s, y1, &odd);
 
-            uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
+            const uint8_t prefix3 = odd ? 0x03 : 0x02;
+#if ECC_ONLY_BENCH
+            (void)prefix3;
             ++local_hashes; MAYBE_WARP_FLUSH();
-            uint64_t fs_partial[4]; for (int k=0;k<4;++k) fs_partial[k]=S[k];
-            uint64_t sub_partial=(uint64_t)half;
-            for (int k=0;k<4 && sub_partial;++k){ uint64_t old=fs_partial[k]; fs_partial[k]=old-sub_partial; sub_partial=(old<sub_partial)?1ull:0ull; }
-            record_partial_result(partial_chars, h20, fs_partial, px3, odd?0x03:0x02, gid,
-                                  d_partial_results, d_partial_count,
-                                  d_partial_overflow, partial_capacity);
-
+#elif HASH_DIAG_MODE != 0
+            consume_hash_diag(hash_diag_probe(prefix3, px3));
+            ++local_hashes;
+            MAYBE_WARP_FLUSH();
+#else
+            uint8_t h20[20]; getHash160_33_from_limbs(prefix3, px3, h20);
+            if constexpr (EnablePartial) {
+                uint64_t fs_partial[4]; for (int k=0;k<4;++k) fs_partial[k]=S[k];
+                uint64_t sub_partial=(uint64_t)half;
+                for (int k=0;k<4 && sub_partial;++k){ uint64_t old=fs_partial[k]; fs_partial[k]=old-sub_partial; sub_partial=(old<sub_partial)?1ull:0ull; }
+                record_partial_result(partial_chars, h20, fs_partial, px3, prefix3, gid,
+                                      d_partial_results, d_partial_count,
+                                      d_partial_overflow, partial_capacity);
+            }
+            ++local_hashes; MAYBE_WARP_FLUSH();
             bool full = hash160_prefix_equals(h20, target_prefix) &&
                         hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix);
             if (__any_sync(full_mask, full)) {
@@ -557,6 +1102,7 @@ __global__ void kernel_point_add_and_check_oneinv(
                 }
                 __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
             }
+#endif
 
             uint64_t last_dx[4];
 #pragma unroll
@@ -612,6 +1158,87 @@ __global__ void kernel_point_add_and_check_oneinv(
     #undef FLUSH_THRESHOLD
 }
 
+template <int B, bool EnablePartial>
+static inline void launch_point_add_and_check_oneinv_t(GPUContext& gpu,
+                                                       uint32_t slices_per_launch,
+                                                       uint32_t partial_digits)
+{
+    kernel_point_add_and_check_oneinv<B, EnablePartial><<<gpu.blocks, gpu.threadsPerBlock, 0, gpu.stream>>>(
+        gpu.d_Px, gpu.d_Py, gpu.d_Rx, gpu.d_Ry,
+        gpu.d_start_scalars, gpu.d_counts256,
+        gpu.threadsTotal,
+        slices_per_launch,
+        gpu.d_found_flag, gpu.d_found_result,
+        gpu.d_partial_results, gpu.d_partial_count, gpu.d_partial_overflow,
+        partial_digits, PARTIAL_RESULT_CAPACITY,
+        gpu.d_hashes_accum,
+        gpu.d_any_left
+    );
+}
+
+static inline cudaError_t launch_point_add_and_check_oneinv(GPUContext& gpu,
+                                                            uint32_t batch_size,
+                                                            uint32_t slices_per_launch,
+                                                            uint32_t partial_digits)
+{
+    if (partial_digits != 0) {
+        switch (batch_size) {
+            case 2:    launch_point_add_and_check_oneinv_t<2, true>(gpu, slices_per_launch, partial_digits); break;
+            case 4:    launch_point_add_and_check_oneinv_t<4, true>(gpu, slices_per_launch, partial_digits); break;
+            case 8:    launch_point_add_and_check_oneinv_t<8, true>(gpu, slices_per_launch, partial_digits); break;
+            case 16:   launch_point_add_and_check_oneinv_t<16, true>(gpu, slices_per_launch, partial_digits); break;
+            case 32:   launch_point_add_and_check_oneinv_t<32, true>(gpu, slices_per_launch, partial_digits); break;
+            case 64:   launch_point_add_and_check_oneinv_t<64, true>(gpu, slices_per_launch, partial_digits); break;
+            case 128:  launch_point_add_and_check_oneinv_t<128, true>(gpu, slices_per_launch, partial_digits); break;
+            case 256:  launch_point_add_and_check_oneinv_t<256, true>(gpu, slices_per_launch, partial_digits); break;
+            case 512:  launch_point_add_and_check_oneinv_t<512, true>(gpu, slices_per_launch, partial_digits); break;
+            case 1024: launch_point_add_and_check_oneinv_t<1024, true>(gpu, slices_per_launch, partial_digits); break;
+            default:   return cudaErrorInvalidValue;
+        }
+    } else {
+        switch (batch_size) {
+            case 2:    launch_point_add_and_check_oneinv_t<2, false>(gpu, slices_per_launch, partial_digits); break;
+            case 4:    launch_point_add_and_check_oneinv_t<4, false>(gpu, slices_per_launch, partial_digits); break;
+            case 8:    launch_point_add_and_check_oneinv_t<8, false>(gpu, slices_per_launch, partial_digits); break;
+            case 16:   launch_point_add_and_check_oneinv_t<16, false>(gpu, slices_per_launch, partial_digits); break;
+            case 32:   launch_point_add_and_check_oneinv_t<32, false>(gpu, slices_per_launch, partial_digits); break;
+            case 64:   launch_point_add_and_check_oneinv_t<64, false>(gpu, slices_per_launch, partial_digits); break;
+            case 128:  launch_point_add_and_check_oneinv_t<128, false>(gpu, slices_per_launch, partial_digits); break;
+            case 256:  launch_point_add_and_check_oneinv_t<256, false>(gpu, slices_per_launch, partial_digits); break;
+            case 512:  launch_point_add_and_check_oneinv_t<512, false>(gpu, slices_per_launch, partial_digits); break;
+            case 1024: launch_point_add_and_check_oneinv_t<1024, false>(gpu, slices_per_launch, partial_digits); break;
+            default:   return cudaErrorInvalidValue;
+        }
+    }
+    return cudaGetLastError();
+}
+
+template <bool EnablePartial>
+static inline void set_point_add_kernel_cache_config_t(uint32_t batch_size)
+{
+    switch (batch_size) {
+        case 2:    (void)cudaFuncSetCacheConfig(kernel_point_add_and_check_oneinv<2, EnablePartial>, cudaFuncCachePreferL1); break;
+        case 4:    (void)cudaFuncSetCacheConfig(kernel_point_add_and_check_oneinv<4, EnablePartial>, cudaFuncCachePreferL1); break;
+        case 8:    (void)cudaFuncSetCacheConfig(kernel_point_add_and_check_oneinv<8, EnablePartial>, cudaFuncCachePreferL1); break;
+        case 16:   (void)cudaFuncSetCacheConfig(kernel_point_add_and_check_oneinv<16, EnablePartial>, cudaFuncCachePreferL1); break;
+        case 32:   (void)cudaFuncSetCacheConfig(kernel_point_add_and_check_oneinv<32, EnablePartial>, cudaFuncCachePreferL1); break;
+        case 64:   (void)cudaFuncSetCacheConfig(kernel_point_add_and_check_oneinv<64, EnablePartial>, cudaFuncCachePreferL1); break;
+        case 128:  (void)cudaFuncSetCacheConfig(kernel_point_add_and_check_oneinv<128, EnablePartial>, cudaFuncCachePreferL1); break;
+        case 256:  (void)cudaFuncSetCacheConfig(kernel_point_add_and_check_oneinv<256, EnablePartial>, cudaFuncCachePreferL1); break;
+        case 512:  (void)cudaFuncSetCacheConfig(kernel_point_add_and_check_oneinv<512, EnablePartial>, cudaFuncCachePreferL1); break;
+        case 1024: (void)cudaFuncSetCacheConfig(kernel_point_add_and_check_oneinv<1024, EnablePartial>, cudaFuncCachePreferL1); break;
+    }
+}
+
+static inline void set_point_add_kernel_cache_config(uint32_t batch_size, uint32_t partial_digits)
+{
+    if (partial_digits != 0) {
+        set_point_add_kernel_cache_config_t<true>(batch_size);
+    } else {
+        set_point_add_kernel_cache_config_t<false>(batch_size);
+    }
+}
+
 extern bool hexToLE64(const std::string& h_in, uint64_t w[4]);
 extern bool hexToHash160(const std::string& h, uint8_t hash160[20]);
 extern std::string formatHex256(const uint64_t limbs[4]);
@@ -635,7 +1262,53 @@ static inline bool parse_uint32_arg(const char* text, uint32_t min_value, uint32
     return true;
 }
 
+static inline bool parse_uint64_arg(const char* text, uint64_t min_value, uint64_t max_value, uint64_t& out) {
+    if (text == nullptr || *text == '\0') return false;
+    uint64_t value = 0;
+    for (const char* p = text; *p != '\0'; ++p) {
+        if (*p < '0' || *p > '9') return false;
+        uint64_t digit = (uint64_t)(*p - '0');
+        if (value > (max_value - digit) / 10ull) return false;
+        value = value * 10ull + digit;
+    }
+    if (value < min_value) return false;
+    out = value;
+    return true;
+}
+
+static inline uint64_t apply_launch_key_cap(uint64_t upper,
+                                            uint64_t threads_per_block,
+                                            uint32_t batch_size,
+                                            uint32_t slices_per_launch,
+                                            uint64_t max_launch_keys,
+                                            bool& capped,
+                                            uint64_t& cap_threads)
+{
+    capped = false;
+    cap_threads = upper;
+    if (max_launch_keys == 0ull || upper == 0ull) return upper;
+
+    uint64_t keys_per_thread = (uint64_t)batch_size * (uint64_t)slices_per_launch;
+    if (keys_per_thread == 0ull) return upper;
+
+    uint64_t cap = max_launch_keys / keys_per_thread;
+    if (cap < threads_per_block) cap = threads_per_block;
+    cap -= cap % threads_per_block;
+    if (cap < threads_per_block) cap = threads_per_block;
+
+    cap_threads = cap;
+    if (cap < upper) {
+        capped = true;
+        return cap;
+    }
+    return upper;
+}
+
 int main(int argc, char** argv) {
+    if (argc >= 2 && std::strcmp(argv[1], "--cpu-worker") == 0) {
+        return cpu_avx2_worker_main(argc - 1, argv + 1);
+    }
+
     std::signal(SIGINT, handle_sigint);
 
     std::cout <<
@@ -645,7 +1318,7 @@ R"(  __  __ _   _ _  _____ ___ ______   ______ _     ___  _   _ _____
  | |  | | |_| | |__| |  | | |___  | || |___| |__| |_| | |\  | |___
  |_|  |_|\___/|____|_| |___\____| |_| \____|_____\___/|_| \_|_____|
 
- MULTICYCLONE v2.1 by Draikoon - forked from Dookoo2 
+ MULTICYCLONE v2.5 by Draikoon - forked from Dookoo2
 
 )";
 
@@ -653,10 +1326,20 @@ R"(  __  __ _   _ _  _____ ___ ______   ______ _     ___  _   _ _____
     uint32_t runtime_points_batch_size = 128;
     uint32_t runtime_batches_per_sm    = 8;
     uint32_t slices_per_launch         = 64;
+    uint32_t runtime_threads_per_block = 256;
+    uint32_t max_seconds               = 0;
     std::string gpu_list_str;
     uint32_t random_interval_seconds   = 0;
     uint32_t partial_digits            = 0;
+    uint32_t cpu_threads               = 0;
+    uint32_t cpu_percent               = 5;
+    uint32_t cpu_bench_seconds         = 3;
+    uint64_t max_launch_keys           = 6000000000ull;
+    std::string self_exe_path          = default_self_exe_path(argv[0]);
+    std::string cpu_exe_path           = self_exe_path;
     bool random_mode = false;
+    bool cpu_auto_percent = false;
+    bool cpu_threads_requested = false;
 
     auto parse_grid = [](const std::string& s, uint32_t& a_out, uint32_t& b_out)->bool {
         size_t comma = s.find(',');
@@ -699,8 +1382,74 @@ R"(  __  __ _   _ _  _____ ___ ______   ______ _     ___  _   _ _____
             }
             slices_per_launch = v;
         }
+        else if ((arg == "--tpb" || arg == "-tpb") && i + 1 < argc) {
+            uint32_t v = 0;
+            if (!parse_uint32_arg(argv[++i], 32u, 256u, v) || (v % 32u) != 0u) {
+                std::cerr << "Error: --tpb must be one of 32,64,96,128,160,192,224,256.\n";
+                return EXIT_FAILURE;
+            }
+            runtime_threads_per_block = v;
+        }
+        else if ((arg == "--seconds" || arg == "-seconds") && i + 1 < argc) {
+            uint32_t v = 0;
+            if (!parse_uint32_arg(argv[++i], 1u, (1u << 20), v)) {
+                std::cerr << "Error: --seconds must be in 1.." << (1u<<20) << "\n";
+                return EXIT_FAILURE;
+            }
+            max_seconds = v;
+        }
         else if ((arg == "--gpus" || arg == "-gpus") && i + 1 < argc) {
             gpu_list_str = argv[++i];
+        }
+        else if ((arg == "--cpu-threads" || arg == "-cpu-threads") && i + 1 < argc) {
+            std::string value = argv[++i];
+            if (value == "auto" || value == "all-1") {
+                cpu_threads = auto_cpu_threads_all_but_one();
+                cpu_threads_requested = true;
+                continue;
+            }
+            uint32_t v = 0;
+            if (!parse_uint32_arg(value.c_str(), 1u, (1u << 20), v)) {
+                std::cerr << "Error: --cpu-threads must be in 1.." << (1u<<20) << "\n";
+                return EXIT_FAILURE;
+            }
+            cpu_threads = v;
+            cpu_threads_requested = true;
+        }
+        else if ((arg == "--cpu-percent" || arg == "-cpu-percent") && i + 1 < argc) {
+            std::string value = argv[++i];
+            if (value == "auto") {
+                cpu_auto_percent = true;
+                continue;
+            }
+            uint32_t v = 0;
+            if (!parse_uint32_arg(value.c_str(), 1u, 99u, v)) {
+                std::cerr << "Error: --cpu-percent must be in 1..99.\n";
+                return EXIT_FAILURE;
+            }
+            cpu_percent = v;
+        }
+        else if ((arg == "--cpu-exe" || arg == "-cpu-exe") && i + 1 < argc) {
+            cpu_exe_path = argv[++i];
+        }
+        else if (arg == "--cpu-auto" || arg == "--auto-cpu-percent") {
+            cpu_auto_percent = true;
+        }
+        else if ((arg == "--cpu-bench-seconds" || arg == "--bench-seconds") && i + 1 < argc) {
+            uint32_t v = 0;
+            if (!parse_uint32_arg(argv[++i], 1u, 3600u, v)) {
+                std::cerr << "Error: --cpu-bench-seconds must be in 1..3600.\n";
+                return EXIT_FAILURE;
+            }
+            cpu_bench_seconds = v;
+        }
+        else if ((arg == "--max-launch-keys" || arg == "-max-launch-keys") && i + 1 < argc) {
+            uint64_t v = 0;
+            if (!parse_uint64_arg(argv[++i], 0ull, UINT64_MAX, v)) {
+                std::cerr << "Error: --max-launch-keys must be a non-negative integer.\n";
+                return EXIT_FAILURE;
+            }
+            max_launch_keys = v;
         }
         else if ((arg == "--random-interval" || arg == "-random-interval") && i + 1 < argc) {
             uint32_t v = 0;
@@ -723,11 +1472,22 @@ R"(  __  __ _   _ _  _____ ___ ______   ______ _     ___  _   _ _____
 
     if (range_hex.empty() || (target_hash_hex.empty() && address_b58.empty())) {
         std::cerr << "Usage: " << argv[0]
-                  << " --range <start_hex>:<end_hex> (--address <base58> | --target-hash160 <hash160_hex>) [--grid A,B] [--slices N] [--gpus GPU1,GPU2,...] [--random-interval SECONDS] [--partial HEX_DIGITS]\n";
+                  << " --range <start_hex>:<end_hex> (--address <base58> | --target-hash160 <hash160_hex>) [--grid A,B] [--slices N] [--tpb THREADS] [--seconds N] [--gpus GPU1,GPU2,...] [--cpu-threads N|auto] [--cpu-percent P|auto] [--cpu-auto] [--cpu-bench-seconds N] [--cpu-exe PATH] [--max-launch-keys N] [--random-interval SECONDS] [--partial HEX_DIGITS]\n";
         return EXIT_FAILURE;
+    }
+    if (cpu_auto_percent && !cpu_threads_requested) {
+        cpu_threads = auto_cpu_threads_all_but_one();
     }
     if (!target_hash_hex.empty() && !address_b58.empty()) {
         std::cerr << "Error: provide either --address or --target-hash160, not both.\n";
+        return EXIT_FAILURE;
+    }
+    if (cpu_threads != 0 && !target_hash_hex.empty()) {
+        std::cerr << "Error: --cpu-threads currently requires --address, because the AVX2 CPU backend accepts P2PKH addresses.\n";
+        return EXIT_FAILURE;
+    }
+    if (cpu_threads != 0 && random_mode) {
+        std::cerr << "Error: --cpu-threads is currently supported only for exhaustive range mode, not --random-interval.\n";
         return EXIT_FAILURE;
     }
 
@@ -746,6 +1506,10 @@ R"(  __  __ _   _ _  _____ ___ ______   ______ _     ___  _   _ _____
     uint64_t range_start[4]{0}, range_end[4]{0};
     if (!hexToLE64(start_hex, range_start) || !hexToLE64(end_hex, range_end)) {
         std::cerr << "Error: invalid range hex\n"; return EXIT_FAILURE;
+    }
+    if (lt256(range_end, range_start)) {
+        std::cerr << "Error: range start must be <= range end\n";
+        return EXIT_FAILURE;
     }
 
     std::cout << "Parsed range: " << formatHex256(range_start) << " - " << formatHex256(range_end) << std::endl;
@@ -772,6 +1536,101 @@ R"(  __  __ _   _ _  _____ ___ ______   ______ _     ___  _   _ _____
     }
 
     uint64_t range_len[4]; sub256(range_end, range_start, range_len); add256_u64(range_len, 1ull, range_len);
+    uint64_t full_range_len[4];
+    copy256_host(range_len, full_range_len);
+    const std::string full_range_arg = formatHex256(range_start) + ":" + formatHex256(range_end);
+    const std::string bench_range_arg = "1000000000000000:1FFFFFFFFFFFFFFF";
+
+    if (cpu_auto_percent) {
+        std::ifstream cpu_exe_check(cpu_exe_path, std::ios::binary);
+        if (!cpu_exe_check) {
+            std::cerr << "Error: CPU worker executable not found: " << cpu_exe_path << "\n";
+            return EXIT_FAILURE;
+        }
+
+        double cpu_mkeys = 0.0;
+        double gpu_mkeys = 0.0;
+        std::cout << "Auto CPU split: benchmarking CPU with " << cpu_threads
+                  << " thread(s) for " << cpu_bench_seconds << " second(s)...\n";
+        if (!benchmark_cpu_worker(cpu_exe_path, address_b58, bench_range_arg,
+                                  cpu_threads, cpu_bench_seconds, cpu_mkeys)) {
+            return EXIT_FAILURE;
+        }
+
+        std::cout << "Auto CPU split: benchmarking GPU with grid "
+                  << runtime_points_batch_size << "," << runtime_batches_per_sm
+                  << " for " << cpu_bench_seconds << " second(s)...\n";
+        if (!benchmark_gpu_self(self_exe_path, bench_range_arg, gpu_list_str,
+                                runtime_points_batch_size, runtime_batches_per_sm,
+                                slices_per_launch, runtime_threads_per_block,
+                                max_launch_keys,
+                                cpu_bench_seconds, gpu_mkeys)) {
+            return EXIT_FAILURE;
+        }
+
+        double share = cpu_mkeys / (cpu_mkeys + gpu_mkeys);
+        uint32_t auto_percent = (uint32_t)std::floor(share * 100.0 + 0.5);
+        if (auto_percent < 1u) auto_percent = 1u;
+        if (auto_percent > 99u) auto_percent = 99u;
+        cpu_percent = auto_percent;
+
+        std::cout << "Auto CPU split: CPU " << std::fixed << std::setprecision(1) << cpu_mkeys
+                  << " Mkeys/s, GPU " << gpu_mkeys
+                  << " Mkeys/s -> CPU gets " << cpu_percent << "% of the range\n";
+    }
+
+    CpuSidecar cpu_sidecar;
+    bool cpu_sidecar_enabled = cpu_threads != 0;
+    std::string cpu_range_arg;
+    uint64_t cpu_range_start[4] = {0, 0, 0, 0};
+    uint64_t cpu_range_end[4] = {0, 0, 0, 0};
+
+    if (cpu_sidecar_enabled) {
+        uint64_t hundred_q[4] = {0, 0, 0, 0};
+        uint64_t hundred_rem[4] = {0, 0, 0, 0};
+        divmod_256_by_u64_array(range_len, 100ull, hundred_q, hundred_rem);
+
+        uint64_t cpu_len[4] = {0, 0, 0, 0};
+        add256_u64_mul(hundred_q, (uint64_t)cpu_percent, cpu_len);
+        uint64_t extra = (hundred_rem[0] * (uint64_t)cpu_percent) / 100ull;
+        add256_u64(cpu_len, extra, cpu_len);
+        if (is_zero_256_host(cpu_len)) {
+            add256_u64(cpu_len, 1ull, cpu_len);
+        }
+
+        if (!lt256(cpu_len, range_len)) {
+            copy256_host(range_len, cpu_len);
+            sub256_u64_host_inplace(cpu_len, 1ull);
+        }
+
+        if (is_zero_256_host(cpu_len)) {
+            std::cout << "CPU sidecar disabled: range is too small to split without overlap.\n";
+            cpu_sidecar_enabled = false;
+            cpu_threads = 0;
+        } else {
+            uint64_t cpu_len_minus_one[4];
+            copy256_host(cpu_len, cpu_len_minus_one);
+            sub256_u64_host_inplace(cpu_len_minus_one, 1ull);
+
+            sub256(range_end, cpu_len_minus_one, cpu_range_start);
+            copy256_host(range_end, cpu_range_end);
+
+            uint64_t gpu_range_end[4];
+            copy256_host(cpu_range_start, gpu_range_end);
+            sub256_u64_host_inplace(gpu_range_end, 1ull);
+            copy256_host(gpu_range_end, range_end);
+
+            sub256(range_end, range_start, range_len);
+            add256_u64(range_len, 1ull, range_len);
+
+            cpu_range_arg = formatHex256(cpu_range_start) + ":" + formatHex256(cpu_range_end);
+            std::cout << "Hybrid split: GPU range " << formatHex256(range_start)
+                      << " - " << formatHex256(range_end) << "\n";
+            std::cout << "Hybrid split: CPU range " << formatHex256(cpu_range_start)
+                      << " - " << formatHex256(cpu_range_end)
+                      << " (" << cpu_percent << "% tail, " << cpu_threads << " thread(s))\n";
+        }
+    }
 
     int device=0; cudaDeviceProp prop{};
     if (cudaGetDevice(&device)!=cudaSuccess || cudaGetDeviceProperties(&prop, device)!=cudaSuccess) {
@@ -835,42 +1694,6 @@ R"(  __  __ _   _ _  _____ ___ ______   ______ _     ___  _   _ _____
     divmod_256_by_u64_array(range_len, (uint64_t)numGPUs, range_per_gpu, range_remainder_arr);
     uint64_t range_remainder = range_remainder_arr[0];
 
-uint64_t total_threads_single = 0;
-    {
-        uint64_t q_div_batch[4], r_div_batch = 0ull;
-        divmod_256_by_u64(range_len, (uint64_t)runtime_points_batch_size, q_div_batch, r_div_batch);
-        bool q_fits_u64 = (q_div_batch[3]|q_div_batch[2]|q_div_batch[1]) == 0ull;
-        uint64_t total_batches_u64 = q_fits_u64 ? q_div_batch[0] : 0ull;
-        
-        cudaDeviceProp prop;
-        cudaGetDeviceProperties(&prop, selectedDevices[0]);
-        int threadsPerBlock = 256;
-        if (threadsPerBlock > (int)prop.maxThreadsPerBlock) threadsPerBlock = prop.maxThreadsPerBlock;
-        if (threadsPerBlock < 32) threadsPerBlock = 32;
-        
-        uint64_t userUpper = (uint64_t)prop.multiProcessorCount * (uint64_t)runtime_batches_per_sm * (uint64_t)threadsPerBlock;
-        if (userUpper == 0ull) userUpper = UINT64_MAX;
-        
-        auto pick_threads_total = [&](uint64_t upper)->uint64_t {
-            if (upper < (uint64_t)threadsPerBlock) return 0ull;
-            uint64_t t = upper - (upper % (uint64_t)threadsPerBlock);
-            uint64_t q = total_batches_u64;
-            while (t >= (uint64_t)threadsPerBlock) {
-                if ((q % t) == 0ull) return t;
-                t -= (uint64_t)threadsPerBlock;
-            }
-            return 0ull;
-        };
-        
-        uint64_t maxThreadsByMem = (prop.totalGlobalMem > 64ull*1024*1024) ? (prop.totalGlobalMem - 64ull*1024*1024) / (2ull*4ull*sizeof(uint64_t)) : (prop.totalGlobalMem / (2ull*4ull*sizeof(uint64_t)));
-        
-        uint64_t upper = maxThreadsByMem;
-        if (total_batches_u64 < upper) upper = total_batches_u64;
-        if (userUpper < upper) upper = userUpper;
-        
-        total_threads_single = pick_threads_total(upper);
-    }
-
     for (int gpuIdx = 0; gpuIdx < numGPUs; ++gpuIdx) {
         GPUContext& gpu = gpus[gpuIdx];
         cudaSetDevice(gpu.deviceId);
@@ -892,8 +1715,10 @@ uint64_t total_threads_single = 0;
 
         cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
 
-        int threadsPerBlock = 256;
+        int threadsPerBlock = (int)runtime_threads_per_block;
         if (threadsPerBlock > (int)gpu.prop.maxThreadsPerBlock) threadsPerBlock = gpu.prop.maxThreadsPerBlock;
+        if (threadsPerBlock < 32) threadsPerBlock = 32;
+        threadsPerBlock -= threadsPerBlock % 32;
         if (threadsPerBlock < 32) threadsPerBlock = 32;
         gpu.threadsPerBlock = threadsPerBlock;
 
@@ -931,10 +1756,31 @@ uint64_t total_threads_single = 0;
         uint64_t upper = maxThreadsByMem;
         if (total_batches_u64 < upper) upper = total_batches_u64;
         if (userUpper < upper) upper = userUpper;
+        uint64_t upper_before_launch_cap = upper;
+        bool launch_capped = false;
+        uint64_t launch_cap_threads = upper;
+        upper = apply_launch_key_cap(upper, (uint64_t)threadsPerBlock,
+                                     runtime_points_batch_size, 1u,
+                                     max_launch_keys, launch_capped, launch_cap_threads);
 
         uint64_t threadsTotal = pick_threads_total(upper);
         if (threadsTotal == 0ull) {
             threadsTotal = (uint64_t)threadsPerBlock;
+        }
+        if (launch_capped && upper_before_launch_cap > upper) {
+            long double requested_keys = (long double)upper_before_launch_cap *
+                                         (long double)runtime_points_batch_size;
+            long double capped_keys = (long double)threadsTotal *
+                                      (long double)runtime_points_batch_size;
+            std::cout << "Launch guard: GPU " << gpuIdx
+                      << " capped threads " << upper_before_launch_cap
+                      << " -> " << threadsTotal
+                      << " because one slice would exceed the launch cap (~"
+                      << std::fixed << std::setprecision(1)
+                      << (double)(capped_keys / 1.0e9L)
+                      << "B keys/slice; requested ~"
+                      << (double)(requested_keys / 1.0e9L)
+                      << "B). Use --max-launch-keys 0 to disable.\n";
         }
         gpu.threadsTotal = threadsTotal;
         gpu.blocks = (int)(threadsTotal / (uint64_t)threadsPerBlock);
@@ -956,6 +1802,36 @@ uint64_t total_threads_single = 0;
 
     const uint32_t B = runtime_points_batch_size;
     const uint32_t half = B >> 1;
+    uint32_t effective_slices_per_launch = slices_per_launch;
+    if (max_launch_keys != 0ull) {
+        for (int gpuIdx = 0; gpuIdx < numGPUs; ++gpuIdx) {
+            const GPUContext& gpu = gpus[gpuIdx];
+            uint64_t keys_per_slice = gpu.threadsTotal * (uint64_t)B;
+            uint32_t safe_slices = slices_per_launch;
+            if (keys_per_slice != 0ull) {
+                uint64_t q = max_launch_keys / keys_per_slice;
+                if (q == 0ull) q = 1ull;
+                if (q < (uint64_t)safe_slices) safe_slices = (uint32_t)q;
+            }
+            if (safe_slices < effective_slices_per_launch) {
+                effective_slices_per_launch = safe_slices;
+            }
+        }
+        if (effective_slices_per_launch < slices_per_launch) {
+            long double keys_per_launch = 0.0L;
+            for (int gpuIdx = 0; gpuIdx < numGPUs; ++gpuIdx) {
+                keys_per_launch += (long double)gpus[gpuIdx].threadsTotal *
+                                   (long double)B *
+                                   (long double)effective_slices_per_launch;
+            }
+            std::cout << "Launch guard: using " << effective_slices_per_launch
+                      << "/" << slices_per_launch
+                      << " slice(s) per launch to keep kernels short (~"
+                      << std::fixed << std::setprecision(1)
+                      << (double)(keys_per_launch / 1.0e9L)
+                      << "B keys/launch). Thread count is preserved where possible.\n";
+        }
+    }
     uint64_t random_sweep_origin[4] = {0, 0, 0, 0};
     uint64_t random_global_offset[4] = {0, 0, 0, 0};
     uint64_t random_sweep_coverage[4] = {0, 0, 0, 0};
@@ -975,16 +1851,16 @@ uint64_t total_threads_single = 0;
         GPUContext& gpu = gpus[gpuIdx];
         cudaSetDevice(gpu.deviceId);
 
-        uint64_t* h_counts256 = nullptr;
-        uint64_t* h_start_scalars = nullptr;
-        cudaHostAlloc(&h_counts256,     gpu.threadsTotal * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
-        cudaHostAlloc(&h_start_scalars, gpu.threadsTotal * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
+        gpu.h_counts256 = nullptr;
+        gpu.h_start_scalars = nullptr;
+        cudaHostAlloc(&gpu.h_counts256,     gpu.threadsTotal * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
+        cudaHostAlloc(&gpu.h_start_scalars, gpu.threadsTotal * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
 
         for (uint64_t i = 0; i < gpu.threadsTotal; ++i) {
-            h_counts256[i*4+0] = gpu.per_thread_cnt[0];
-            h_counts256[i*4+1] = gpu.per_thread_cnt[1];
-            h_counts256[i*4+2] = gpu.per_thread_cnt[2];
-            h_counts256[i*4+3] = gpu.per_thread_cnt[3];
+            gpu.h_counts256[i*4+0] = gpu.per_thread_cnt[0];
+            gpu.h_counts256[i*4+1] = gpu.per_thread_cnt[1];
+            gpu.h_counts256[i*4+2] = gpu.per_thread_cnt[2];
+            gpu.h_counts256[i*4+3] = gpu.per_thread_cnt[3];
         }
 
         {
@@ -998,10 +1874,10 @@ uint64_t total_threads_single = 0;
                     base[0]=cur[0]; base[1]=cur[1]; base[2]=cur[2]; base[3]=cur[3];
                 }
                 uint64_t Sc[4]; add256_u64(base, (uint64_t)half, Sc); 
-                h_start_scalars[i*4+0] = Sc[0];
-                h_start_scalars[i*4+1] = Sc[1];
-                h_start_scalars[i*4+2] = Sc[2];
-                h_start_scalars[i*4+3] = Sc[3];
+                gpu.h_start_scalars[i*4+0] = Sc[0];
+                gpu.h_start_scalars[i*4+1] = Sc[1];
+                gpu.h_start_scalars[i*4+2] = Sc[2];
+                gpu.h_start_scalars[i*4+3] = Sc[3];
 
                 if (!random_mode) {
                     uint64_t next[4]; add256(cur, gpu.per_thread_cnt, next);
@@ -1031,17 +1907,14 @@ uint64_t total_threads_single = 0;
         ck(cudaMalloc(&gpu.d_hashes_accum, sizeof(unsigned long long)),          "cudaMalloc(d_hashes_accum)");
         ck(cudaMalloc(&gpu.d_any_left,     sizeof(unsigned int)),                "cudaMalloc(d_any_left)");
 
-        ck(cudaMemcpy(gpu.d_start_scalars, h_start_scalars, gpu.threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy start_scalars");
-        ck(cudaMemcpy(gpu.d_counts256,     h_counts256,     gpu.threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy counts256");
+        ck(cudaMemcpy(gpu.d_start_scalars, gpu.h_start_scalars, gpu.threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy start_scalars");
+        ck(cudaMemcpy(gpu.d_counts256,     gpu.h_counts256,     gpu.threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy counts256");
         { int zero = FOUND_NONE; unsigned long long zero64=0ull; unsigned int zeroU=0u;
           ck(cudaMemcpy(gpu.d_found_flag, &zero,   sizeof(int),                cudaMemcpyHostToDevice), "init found_flag");
           ck(cudaMemcpy(gpu.d_partial_count, &zeroU, sizeof(uint32_t),          cudaMemcpyHostToDevice), "init partial_count");
           ck(cudaMemcpy(gpu.d_partial_overflow, &zeroU, sizeof(uint32_t),       cudaMemcpyHostToDevice), "init partial_overflow");
           ck(cudaMemcpy(gpu.d_hashes_accum, &zero64, sizeof(unsigned long long), cudaMemcpyHostToDevice), "init hashes_accum");
           ck(cudaMemcpy(gpu.d_any_left, &zeroU, sizeof(unsigned int), cudaMemcpyHostToDevice), "init any_left"); }
-
-        cudaFreeHost(h_counts256);
-        cudaFreeHost(h_start_scalars);
 
         {
             int blocks_scal = (int)((gpu.threadsTotal + gpu.threadsPerBlock - 1) / gpu.threadsPerBlock);
@@ -1069,14 +1942,35 @@ uint64_t total_threads_single = 0;
 
             uint64_t* h_Gx_half = (uint64_t*)std::malloc((size_t)half * 4 * sizeof(uint64_t));
             uint64_t* h_Gy_half = (uint64_t*)std::malloc((size_t)half * 4 * sizeof(uint64_t));
+            uint64_t* h_Gny_half = (uint64_t*)std::malloc((size_t)half * 4 * sizeof(uint64_t));
             ck(cudaMemcpy(h_Gx_half, d_Gx_half, (size_t)half * 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost), "D2H Gx_half");
             ck(cudaMemcpy(h_Gy_half, d_Gy_half, (size_t)half * 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost), "D2H Gy_half");
+            const uint64_t field_p[4] = {
+                0xFFFFFFFEFFFFFC2FULL, 0xFFFFFFFFFFFFFFFFULL,
+                0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL
+            };
+            for (uint32_t i = 0; i < half; ++i) {
+                const uint64_t* y = h_Gy_half + (size_t)i * 4;
+                uint64_t* ny = h_Gny_half + (size_t)i * 4;
+                if ((y[0] | y[1] | y[2] | y[3]) == 0ull) {
+                    ny[0] = ny[1] = ny[2] = ny[3] = 0ull;
+                } else {
+                    uint64_t borrow = 0ull;
+                    for (int k = 0; k < 4; ++k) {
+                        const uint64_t subtrahend = y[k] + borrow;
+                        const uint64_t borrow_from_add = (subtrahend < y[k]) ? 1ull : 0ull;
+                        ny[k] = field_p[k] - subtrahend;
+                        borrow = borrow_from_add | ((field_p[k] < subtrahend) ? 1ull : 0ull);
+                    }
+                }
+            }
             ck(cudaMemcpyToSymbol(c_Gx, h_Gx_half, (size_t)half * 4 * sizeof(uint64_t)), "ToSymbol c_Gx");
             ck(cudaMemcpyToSymbol(c_Gy, h_Gy_half, (size_t)half * 4 * sizeof(uint64_t)), "ToSymbol c_Gy");
+            ck(cudaMemcpyToSymbol(c_Gny, h_Gny_half, (size_t)half * 4 * sizeof(uint64_t)), "ToSymbol c_Gny");
 
             cudaFree(d_scalars_half); cudaFree(d_Gx_half); cudaFree(d_Gy_half);
             cudaFreeHost(h_scalars_half);
-            std::free(h_Gx_half); std::free(h_Gy_half);
+            std::free(h_Gx_half); std::free(h_Gy_half); std::free(h_Gny_half);
         }
         {
             uint64_t* h_scalarB = nullptr;
@@ -1116,7 +2010,7 @@ uint64_t total_threads_single = 0;
     }
 
     cudaSetDevice(gpus[0].deviceId);
-    std::cout << "Single-GPU threads: " << total_threads_single << "\n";
+    std::cout << "Single-GPU threads: " << gpus[0].threadsTotal << "\n";
     for (int gpuIdx = 0; gpuIdx < numGPUs; ++gpuIdx) {
         GPUContext& gpu = gpus[gpuIdx];
         std::cout << "GPU " << gpuIdx << ": " << gpu.prop.name << " (compute " << gpu.prop.major << "." << gpu.prop.minor << ")\n";
@@ -1136,8 +2030,7 @@ uint64_t total_threads_single = 0;
         std::cout << "Partial hash160 saving: first " << partial_digits
                   << " hex chars to partial.txt; longer matches to partialpN.txt\n\n";
     }
-
-    (void)cudaFuncSetCacheConfig(kernel_point_add_and_check_oneinv, cudaFuncCachePreferL1);
+    set_point_add_kernel_cache_config(B, partial_digits);
 
     auto t0 = std::chrono::high_resolution_clock::now();
     auto tLast = t0;
@@ -1152,6 +2045,33 @@ uint64_t total_threads_single = 0;
     std::vector<uint64_t> gpuSlice(numGPUs, 0ull);
     std::vector<std::array<uint64_t,4>> gpuCurrentKey(numGPUs);
     std::vector<PartialResult> partialHost(PARTIAL_RESULT_CAPACITY);
+    std::vector<unsigned long long> partialSavedByExtra(41, 0ull);
+    CpuLiveStats cpuLiveStats;
+
+    auto print_partial_live_counts = [&]() {
+        if (partial_digits == 0) return;
+        unsigned long long total_saved = 0ull;
+        for (unsigned long long saved : partialSavedByExtra) total_saved += saved;
+
+        std::cout << " | Partials: ";
+        if (total_saved == 0ull) {
+            std::cout << "0";
+            return;
+        }
+
+        bool first = true;
+        for (size_t extra = 0; extra < partialSavedByExtra.size(); ++extra) {
+            unsigned long long saved = partialSavedByExtra[extra];
+            if (saved == 0ull) continue;
+            if (!first) std::cout << " ";
+            if (extra == 0) {
+                std::cout << "partial.txt=" << saved;
+            } else {
+                std::cout << "partialp" << extra << ".txt=" << saved;
+            }
+            first = false;
+        }
+    };
 
     auto drain_partial_results = [&](GPUContext& gpu, int gpuIdx) {
         if (partial_digits == 0) return;
@@ -1172,6 +2092,9 @@ uint64_t total_threads_single = 0;
 
         for (uint32_t i = 0; i < to_copy; ++i) {
             const PartialResult& r = partialHost[i];
+            uint32_t extra = (r.match_chars > partial_digits) ? (r.match_chars - partial_digits) : 0u;
+            if (extra >= partialSavedByExtra.size()) extra = (uint32_t)partialSavedByExtra.size() - 1u;
+            ++partialSavedByExtra[extra];
             std::ofstream out(partialOutputFile(partial_digits, r.match_chars), std::ios::app);
             out << "Hex: " << formatHex256(r.scalar)
                 << " Hash160: " << formatHash160Hex(r.hash160) << "\n";
@@ -1190,19 +2113,7 @@ uint64_t total_threads_single = 0;
         unsigned int zeroU = 0u;
         ck(cudaMemcpyAsync(gpu.d_any_left, &zeroU, sizeof(unsigned int), cudaMemcpyHostToDevice, gpu.stream), "zero d_any_left");
         
-        kernel_point_add_and_check_oneinv<<<gpu.blocks, gpu.threadsPerBlock, 0, gpu.stream>>>(
-            gpu.d_Px, gpu.d_Py, gpu.d_Rx, gpu.d_Ry,
-            gpu.d_start_scalars, gpu.d_counts256,
-            gpu.threadsTotal,
-            B,
-            slices_per_launch,
-            gpu.d_found_flag, gpu.d_found_result,
-            gpu.d_partial_results, gpu.d_partial_count, gpu.d_partial_overflow,
-            partial_digits, PARTIAL_RESULT_CAPACITY,
-            gpu.d_hashes_accum,
-            gpu.d_any_left
-        );
-        cudaError_t launchErr = cudaGetLastError();
+        cudaError_t launchErr = launch_point_add_and_check_oneinv(gpu, B, effective_slices_per_launch, partial_digits);
         if (launchErr != cudaSuccess) {
             std::cerr << "\nKernel launch error on GPU " << gpuIdx << ": " << cudaGetErrorString(launchErr) << "\n";
             return EXIT_FAILURE;
@@ -1211,11 +2122,46 @@ uint64_t total_threads_single = 0;
         gpuNeedsLaunch[gpuIdx] = false;
     }
 
+    if (cpu_sidecar_enabled) {
+        std::ifstream cpu_exe_check(cpu_exe_path, std::ios::binary);
+        if (!cpu_exe_check) {
+            std::cerr << "Error: CPU worker executable not found: " << cpu_exe_path << "\n";
+            return EXIT_FAILURE;
+        }
+        std::cout << "CPU sidecar: launching " << cpu_threads << " AVX2 thread(s), "
+                  << cpu_percent << "% tail range\n";
+        std::cout << "CPU sidecar log: cpu_worker.log\n";
+        if (!launch_cpu_sidecar(cpu_sidecar, cpu_exe_path, address_b58, cpu_range_arg, cpu_threads)) {
+            return EXIT_FAILURE;
+        }
+    }
+
     while (!stop_all) {
         if (g_sigint) {
             std::cerr << "\n[Ctrl+C] Interrupt received. Finishing current kernel slices and exiting...\n";
             stop_all = true;
         }
+
+        if (cpu_sidecar.active) {
+            bool cpu_found = false;
+            bool cpu_running = poll_cpu_sidecar(cpu_sidecar, cpu_found);
+            if (!cpu_running) {
+                if (cpu_found) {
+                    stop_all = true;
+                    found_any.store(true);
+                    std::cout << "\n======== FOUND MATCH! =================================\n";
+                    std::cout << "Found on CPU AVX2 sidecar\n";
+                    if (write_cpu_found_summary_from_file()) {
+                        std::cout << "Result saved to found_key.txt\n";
+                    }
+                    std::cout << "Full CPU output: cpu_worker.log\n";
+                } else if (!stop_all) {
+                    std::cout << "\nCPU sidecar completed its assigned range.\n";
+                }
+            }
+        }
+
+        if (stop_all) break;
 
         bool any_stream_busy = false;
         unsigned long long totalHashes = 0ull;
@@ -1238,7 +2184,7 @@ uint64_t total_threads_single = 0;
                     gpuCompleted[gpuIdx] = true;
                 } else {
                     gpuSlice[gpuIdx]++;
-                    if (gpuSlice[gpuIdx] >= slices_per_launch) gpuSlice[gpuIdx] = 0;
+                    if (gpuSlice[gpuIdx] >= effective_slices_per_launch) gpuSlice[gpuIdx] = 0;
                     std::swap(gpu.d_Px, gpu.d_Rx);
                     std::swap(gpu.d_Py, gpu.d_Ry);
                     gpuNeedsLaunch[gpuIdx] = true;
@@ -1299,19 +2245,7 @@ uint64_t total_threads_single = 0;
             unsigned int zeroU = 0u;
             ck(cudaMemcpyAsync(gpu.d_any_left, &zeroU, sizeof(unsigned int), cudaMemcpyHostToDevice, gpu.stream), "zero d_any_left");
 
-            kernel_point_add_and_check_oneinv<<<gpu.blocks, gpu.threadsPerBlock, 0, gpu.stream>>>(
-                gpu.d_Px, gpu.d_Py, gpu.d_Rx, gpu.d_Ry,
-                gpu.d_start_scalars, gpu.d_counts256,
-                gpu.threadsTotal,
-                B,
-                slices_per_launch,
-                gpu.d_found_flag, gpu.d_found_result,
-                gpu.d_partial_results, gpu.d_partial_count, gpu.d_partial_overflow,
-                partial_digits, PARTIAL_RESULT_CAPACITY,
-                gpu.d_hashes_accum,
-                gpu.d_any_left
-            );
-            cudaError_t launchErr = cudaGetLastError();
+            cudaError_t launchErr = launch_point_add_and_check_oneinv(gpu, B, effective_slices_per_launch, partial_digits);
             if (launchErr != cudaSuccess) {
                 std::cerr << "\nKernel launch error on GPU " << gpuIdx << ": " << cudaGetErrorString(launchErr) << "\n";
                 stop_all = true;
@@ -1328,34 +2262,55 @@ uint64_t total_threads_single = 0;
                     break;
                 }
             }
-            if (all_completed) {
+            if (all_completed && !cpu_sidecar.active) {
                 stop_all = true;
             }
         }
 
-        if (any_stream_busy && !stop_all) {
+        if ((any_stream_busy || cpu_sidecar.active) && !stop_all) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
         auto now = std::chrono::high_resolution_clock::now();
+        double elapsed_for_limit = std::chrono::duration<double>(now - t0).count();
+        if (max_seconds != 0 && elapsed_for_limit >= (double)max_seconds) {
+            stop_all = true;
+        }
         double dt = std::chrono::duration<double>(now - tLast).count();
         if (dt >= 1.0) {
             double delta = (double)(totalHashes - lastHashes);
             double mkeys = delta / (dt * 1e6);
             double elapsed = std::chrono::duration<double>(now - t0).count();
-            long double total_keys_ld = ld_from_u256(range_len);
-            long double prog = total_keys_ld > 0.0L ? ((long double)totalHashes / total_keys_ld) * 100.0L : 0.0L;
+            bool have_cpu_stats = cpu_sidecar_enabled && read_cpu_live_stats(cpu_sidecar.stats_path, cpuLiveStats);
+            bool cpu_speed_active = have_cpu_stats && cpu_sidecar.active && !cpuLiveStats.done;
+            double cpu_live_mkeys = cpu_speed_active ? cpuLiveStats.mkeys : 0.0;
+            unsigned long long displayCount = totalHashes + (have_cpu_stats ? cpuLiveStats.checked : 0ull);
+            double displayMkeys = mkeys + cpu_live_mkeys;
+            long double total_keys_ld = ld_from_u256(full_range_len);
+            long double prog = total_keys_ld > 0.0L ? ((long double)displayCount / total_keys_ld) * 100.0L : 0.0L;
             if (prog > 100.0L) prog = 100.0L;
 
             std::cout << "\rTime: " << std::fixed << std::setprecision(1) << elapsed
-                      << " s | Speed: " << std::fixed << std::setprecision(1) << mkeys
-                      << " Mkeys/s | Count: " << totalHashes
+                      << " s | Speed: " << std::fixed << std::setprecision(1) << displayMkeys
+                      << " Mkeys/s";
+            if (have_cpu_stats) {
+                std::cout << " | GPU: " << std::fixed << std::setprecision(1) << mkeys
+                          << " | CPU: " << std::fixed << std::setprecision(1) << cpu_live_mkeys;
+            }
+            std::cout << " | Count: " << displayCount
                       << " | Progress: " << std::fixed << std::setprecision(2) << (double)prog << " %";
             
             for (int gpuIdx = 0; gpuIdx < numGPUs; ++gpuIdx) {
                 if (gpuCompleted[gpuIdx]) std::cout << " [GPU" << gpuIdx << ":done]";
-                else std::cout << " [GPU" << gpuIdx << ":S" << (gpuSlice[gpuIdx]+1) << "/" << slices_per_launch << "|" << formatHex256Trimmed(gpuCurrentKey[gpuIdx].data()) << "]";
+                else std::cout << " [GPU" << gpuIdx << ":S" << (gpuSlice[gpuIdx]+1) << "/" << effective_slices_per_launch << "|" << formatHex256Trimmed(gpuCurrentKey[gpuIdx].data()) << "]";
             }
+            if (have_cpu_stats) {
+                std::cout << " [CPU:" << cpuLiveStats.threads << "T"
+                          << "|" << std::fixed << std::setprecision(2) << cpuLiveStats.progress << "%";
+                if (cpuLiveStats.done) std::cout << "|done";
+                std::cout << "]";
+            }
+            print_partial_live_counts();
             std::cout.flush();
             lastHashes = totalHashes; tLast = now;
 
@@ -1382,9 +2337,10 @@ uint64_t total_threads_single = 0;
 
                             uint64_t Sc[4];
                             add256_u64(base_key, half, Sc);
-                            cudaMemcpy(gpu.d_start_scalars + t*4, Sc, 4*sizeof(uint64_t), cudaMemcpyHostToDevice);
-
-                            cudaMemcpy(gpu.d_counts256 + t*4, gpu.per_thread_cnt, 4*sizeof(uint64_t), cudaMemcpyHostToDevice);
+                            gpu.h_start_scalars[t*4+0] = Sc[0];
+                            gpu.h_start_scalars[t*4+1] = Sc[1];
+                            gpu.h_start_scalars[t*4+2] = Sc[2];
+                            gpu.h_start_scalars[t*4+3] = Sc[3];
 
                             uint64_t next_offset[4];
                             add256(cur_offset, gpu.per_thread_cnt, next_offset);
@@ -1396,26 +2352,23 @@ uint64_t total_threads_single = 0;
 
                         unsigned int zeroU = 0u;
                         int zero = FOUND_NONE;
-                        cudaMemcpy(gpu.d_any_left, &zeroU, sizeof(unsigned int), cudaMemcpyHostToDevice);
-                        cudaMemcpy(gpu.d_found_flag, &zero, sizeof(int), cudaMemcpyHostToDevice);
+                        ck(cudaMemcpy(gpu.d_start_scalars, gpu.h_start_scalars,
+                                      gpu.threadsTotal * 4 * sizeof(uint64_t),
+                                      cudaMemcpyHostToDevice), "random cpy start_scalars");
+                        ck(cudaMemcpy(gpu.d_counts256, gpu.h_counts256,
+                                      gpu.threadsTotal * 4 * sizeof(uint64_t),
+                                      cudaMemcpyHostToDevice), "random cpy counts256");
+                        ck(cudaMemcpy(gpu.d_any_left, &zeroU, sizeof(unsigned int), cudaMemcpyHostToDevice), "random reset any_left");
+                        ck(cudaMemcpy(gpu.d_found_flag, &zero, sizeof(int), cudaMemcpyHostToDevice), "random reset found_flag");
 
                         int blocks_scal = (int)((gpu.threadsTotal + gpu.threadsPerBlock - 1) / gpu.threadsPerBlock);
                         scalarMulKernelBase<<<blocks_scal, gpu.threadsPerBlock>>>(gpu.d_start_scalars, gpu.d_Px, gpu.d_Py, (int)gpu.threadsTotal);
-                        cudaDeviceSynchronize();
+                        ck(cudaDeviceSynchronize(), "random scalarMulKernelBase sync");
+                        ck(cudaGetLastError(), "random scalarMulKernelBase launch");
 
                         cudaMemcpyAsync(gpu.d_any_left, &zeroU, sizeof(unsigned int), cudaMemcpyHostToDevice, gpu.stream);
-                        kernel_point_add_and_check_oneinv<<<gpu.blocks, gpu.threadsPerBlock, 0, gpu.stream>>>(
-                            gpu.d_Px, gpu.d_Py, gpu.d_Rx, gpu.d_Ry,
-                            gpu.d_start_scalars, gpu.d_counts256,
-                            gpu.threadsTotal,
-                            B,
-                            slices_per_launch,
-                            gpu.d_found_flag, gpu.d_found_result,
-                            gpu.d_partial_results, gpu.d_partial_count, gpu.d_partial_overflow,
-                            partial_digits, PARTIAL_RESULT_CAPACITY,
-                            gpu.d_hashes_accum,
-                            gpu.d_any_left
-                        );
+                        ck(launch_point_add_and_check_oneinv(gpu, B, effective_slices_per_launch, partial_digits),
+                           "random kernel_point_add_and_check_oneinv launch");
                         cudaEventRecord(gpu.kernelDone, gpu.stream);
                         gpuSlice[gpuIdx] = 0;
                         gpuCompleted[gpuIdx] = false;
@@ -1434,10 +2387,14 @@ uint64_t total_threads_single = 0;
                     break;
                 }
             }
-            if (all_completed) {
+            if (all_completed && !cpu_sidecar.active) {
                 stop_all = true;
             }
         }
+    }
+
+    if (cpu_sidecar.active) {
+        terminate_cpu_sidecar(cpu_sidecar);
     }
 
     for (int gpuIdx = 0; gpuIdx < numGPUs; ++gpuIdx) {
@@ -1447,6 +2404,24 @@ uint64_t total_threads_single = 0;
         drain_partial_results(gpu, gpuIdx);
     }
     std::cout << "\n";
+
+    if (found_any.load() && partial_digits != 0) {
+        std::cout << "======== PARTIALS SAVED ===============================\n";
+        bool any_partial_saved = false;
+        for (size_t extra = 0; extra < partialSavedByExtra.size(); ++extra) {
+            unsigned long long saved = partialSavedByExtra[extra];
+            if (saved == 0ull) continue;
+            any_partial_saved = true;
+            if (extra == 0) {
+                std::cout << "partial.txt: " << saved << "\n";
+            } else {
+                std::cout << "partialp" << extra << ".txt: " << saved << "\n";
+            }
+        }
+        if (!any_partial_saved) {
+            std::cout << "No partial candidates were saved before the match.\n";
+        }
+    }
 
     int exit_code = EXIT_SUCCESS;
 
@@ -1472,6 +2447,8 @@ uint64_t total_threads_single = 0;
         cudaFree(gpu.d_found_flag); cudaFree(gpu.d_found_result);
         cudaFree(gpu.d_partial_results); cudaFree(gpu.d_partial_count); cudaFree(gpu.d_partial_overflow);
         cudaFree(gpu.d_hashes_accum); cudaFree(gpu.d_any_left);
+        if (gpu.h_start_scalars) cudaFreeHost(gpu.h_start_scalars);
+        if (gpu.h_counts256) cudaFreeHost(gpu.h_counts256);
         cudaEventDestroy(gpu.kernelDone);
         cudaStreamDestroy(gpu.stream);
     }

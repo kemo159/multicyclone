@@ -124,7 +124,7 @@ __device__ void ShiftR62(uint64_t r[5]) {
 
 }
 
-__device__ void ModSub256isOdd(uint64_t* a, uint64_t* b, uint8_t* parity) {    //no need to compute py, we need only parity
+__device__ __forceinline__ void ModSub256isOdd(uint64_t* a, uint64_t* b, uint8_t* parity) {    //no need to compute py, we need only parity
 
     uint64_t t;   
     uint64_t T[4]; 
@@ -224,7 +224,7 @@ __device__ void MulP(uint64_t *r,uint64_t a) {
 
 }
 
-__device__ void ModNeg256(uint64_t *r,uint64_t *a) {
+__device__ __forceinline__ void ModNeg256(uint64_t *r,uint64_t *a) {
 
   uint64_t t[4];
   USUBO(t[0],0ULL,a[0]);
@@ -238,7 +238,7 @@ __device__ void ModNeg256(uint64_t *r,uint64_t *a) {
 
 }
 
-__device__ void ModNeg256(uint64_t *r) {
+__device__ __forceinline__ void ModNeg256(uint64_t *r) {
 
   uint64_t t[4];
   USUBO(t[0],0ULL,r[0]);
@@ -252,7 +252,7 @@ __device__ void ModNeg256(uint64_t *r) {
 
 }
 
-__device__ void ModSub256(uint64_t *r,uint64_t *a,uint64_t *b) {
+__device__ __forceinline__ void ModSub256(uint64_t *r,uint64_t *a,uint64_t *b) {
 
     uint64_t borrow;
     uint64_t p[4] = { 0xFFFFFFFEFFFFFC2FULL, 0xFFFFFFFFFFFFFFFFULL,
@@ -271,7 +271,7 @@ __device__ void ModSub256(uint64_t *r,uint64_t *a,uint64_t *b) {
         UADD1(r[3], p[3]);
     }
 }
-__device__ void ModSub256(uint64_t* r,uint64_t* b) {
+__device__ __forceinline__ void ModSub256(uint64_t* r,uint64_t* b) {
 
     uint64_t borrow;
     uint64_t p[4] = { 0xFFFFFFFEFFFFFC2FULL, 0xFFFFFFFFFFFFFFFFULL,
@@ -771,7 +771,7 @@ __device__ void _ModSqr(uint64_t *rp,const uint64_t *up) {
 
   uint64_t t[NBBLOCK];
 
-  UMult(t,(r512 + 4),0x1000003D1ULL);
+  UMultSpecial(t,(r512 + 4));
   UADDO1(r512[0],t[0]);
   UADDC1(r512[1],t[1]);
   UADDC1(r512[2],t[2]);
@@ -1220,4 +1220,3 @@ __global__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, 
 
     scalarMulBaseAffine(scalar, outx, outy);
 }
-
