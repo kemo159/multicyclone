@@ -72,7 +72,7 @@ See [BUILD.md](BUILD.md) for full package installation notes.
 From a PowerShell session with CUDA, CMake, and MSVC available:
 
 ```powershell
-cmake -S . -B build-msvc -A x64 -DCMAKE_CUDA_ARCHITECTURES=120
+cmake -S . -B build-msvc -A x64
 cmake --build build-msvc --config Release --parallel
 .\build-msvc\Release\CUDACyclone.exe --help
 ```
@@ -92,7 +92,7 @@ make -j"$(nproc)"
 Using CMake:
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ./build/CUDACyclone --help
 ```
@@ -110,14 +110,18 @@ Then build using the Linux commands above.
 
 ## CUDA Architecture Selection
 
-Pick the CUDA architecture that matches your GPU:
+By default, the Makefile and CMake build compile every known architecture from GTX 1660 / Turing `sm_75` upward that your installed `nvcc` supports. This makes one binary cover older Turing cards and newer Ampere, Ada, Hopper, and Blackwell cards.
+
+For smaller single-GPU local builds, you can override the architecture manually:
 
 | GPU family | CMake architecture |
 |------------|--------------------|
+| GTX 16xx / RTX 20xx | `75`      |
 | RTX 30xx   | `86`               |
+| Jetson Orin| `87`               |
 | RTX 40xx   | `89`               |
 | Hopper/H100| `90`               |
-| RTX 50xx / Blackwell | `120` or `121` |
+| Blackwell/RTX 50xx | `120` or `121` |
 
 Examples:
 
@@ -126,7 +130,7 @@ cmake -S . -B build-msvc -A x64 -DCMAKE_CUDA_ARCHITECTURES=89
 cmake -S . -B build-msvc -A x64 -DCMAKE_CUDA_ARCHITECTURES="89;120"
 ```
 
-The Makefile queries `nvcc --list-gpu-arch` and automatically filters known architectures supported by the installed CUDA toolkit.
+The Makefile and CMake query `nvcc --list-gpu-arch` and automatically filter known architectures supported by the installed CUDA toolkit.
 
 ## Usage
 

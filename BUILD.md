@@ -36,7 +36,7 @@ The `cl` command should print Microsoft compiler information. If PowerShell cann
 From the project directory:
 
 ```powershell
-cmake -S . -B build-msvc -A x64 -DCMAKE_CUDA_ARCHITECTURES=120
+cmake -S . -B build-msvc -A x64
 cmake --build build-msvc --config Release --parallel
 ```
 
@@ -60,10 +60,12 @@ Hybrid CPU/GPU smoke test:
 
 ### Choosing CUDA Architectures
 
-Use the architecture that matches your GPU:
+Default builds compile every known architecture from GTX 1660 / Turing `sm_75` upward that your installed CUDA toolkit supports. Override the list only when you want a smaller binary for one GPU generation:
 
 ```text
+GTX 16xx / RTX 20xx: 75
 RTX 30xx: 86
+Jetson Orin: 87
 RTX 40xx: 89
 Hopper/H100: 90
 Blackwell/RTX 50xx: 120 or 121
@@ -140,7 +142,7 @@ The Makefile builds the CUDA pipeline and the embedded AVX2 CPU worker into one 
 ### Build With CMake
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ```
 
