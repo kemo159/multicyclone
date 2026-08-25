@@ -1,0 +1,14 @@
+Built with CUDA 13.1 (nvcc V13.1.115) + MSVC 14.44, sm_120 only (RTX 50-series).
+
+Includes the per-thread tail fix: per_thread_cnt is rounded up to a multiple of
+the batch size B. Binaries built before 2026-08-25 rounded by a whole B, which
+left every thread with 0 < rem < B forever -- the kernel's `rem >= B` guard
+could not consume it while `rem != 0` kept setting d_any_left, so the host
+relaunched an empty kernel indefinitely, pinned at 100%.
+
+For any other GPU, build from source - see README.md.
+
+Also supports checkpoint/resume: a run stopped with Ctrl+C or --seconds writes
+cyclone_checkpoint.txt, and re-running the same command with --resume continues
+from there. --resume refuses to run unless the target, --range, --grid, --slices,
+--tpb and GPU set all match what the checkpoint was written under.

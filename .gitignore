@@ -1,0 +1,41 @@
+# CMake scratch tree
+build-pool/
+build/
+build-fix/
+
+# compiler / linker output
+*.o
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+
+# build products -- source only, see the NOTES.txt in each bin- dir to build
+/CUDACyclone
+/CUDACyclone.exe
+bin-windows/CUDACyclone.exe
+bin-linux/CUDACyclone
+
+# local working backups
+*.bak_*
+
+# runtime output
+found_key.txt
+found_keys.txt
+cyclone_checkpoint.txt
+# default checkpoint name is cyclone_checkpoint.txt; add your own
+# --checkpoint FILE name here too
+chkpnt
+cpu_worker.log
+cpu_worker.stats
+partial.txt
+partialp*.txt
+progress_save.txt
+
+# editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+__pycache__/
