@@ -1778,14 +1778,34 @@ static bool write_checkpoint(const std::string& path, const Checkpoint& cp,
     uint8_t tag[32];
     hmac_sha256(key.mac, sizeof(key.mac), signed_bytes.data(), signed_bytes.size(), tag);
 
-    std::ofstream out(path, std::ios::trunc);
-    if (!out) return false;
-    out << CHECKPOINT_MAGIC << " " << CHECKPOINT_VERSION << " enc\n";
-    out << "nonce=" << bytes_to_hex(nonce, 16) << "\n";
-    out << "mac="   << bytes_to_hex(tag, 32)   << "\n";
-    out << "data="  << bytes_to_hex(ct.data(), ct.size()) << "\n";
-    out.flush();
-    return (bool)out;
+    // Write to a sibling temp file and rename over the target. --autosavetimer
+    // rewrites this file every N seconds while the search runs, so a crash or a
+    // power cut during the write must not be able to truncate the only record of
+    // hours of progress. Rename is atomic on both NTFS and POSIX.
+    const std::string tmp_path = path + ".tmp";
+    {
+        std::ofstream out(tmp_path, std::ios::trunc);
+        if (!out) return false;
+        out << CHECKPOINT_MAGIC << " " << CHECKPOINT_VERSION << " enc\n";
+        out << "nonce=" << bytes_to_hex(nonce, 16) << "\n";
+        out << "mac="   << bytes_to_hex(tag, 32)   << "\n";
+        out << "data="  << bytes_to_hex(ct.data(), ct.size()) << "\n";
+        out.flush();
+        if (!out) { out.close(); std::remove(tmp_path.c_str()); return false; }
+    }
+#if defined(_WIN32)
+    if (!MoveFileExA(tmp_path.c_str(), path.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        std::remove(tmp_path.c_str());
+        return false;
+    }
+#else
+    if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+        std::remove(tmp_path.c_str());
+        return false;
+    }
+#endif
+    return true;
 }
 
 static bool read_checkpoint(const std::string& path, Checkpoint& cp,
@@ -1950,6 +1970,7 @@ R"(  __  __ _   _ _  _____ ___ ______   ______ _     ___  _   _ _____
     uint32_t slices_per_launch         = 64;
     uint32_t runtime_threads_per_block = 256;
     uint32_t max_seconds               = 0;
+    uint32_t autosave_seconds          = 0;
     std::string gpu_list_str;
     uint32_t random_interval_seconds   = 0;
     uint32_t partial_digits            = 0;
@@ -2028,6 +2049,15 @@ R"(  __  __ _   _ _  _____ ___ ______   ______ _     ___  _   _ _____
                 return EXIT_FAILURE;
             }
             max_seconds = v;
+        }
+        else if ((arg == "--autosavetimer" || arg == "-autosavetimer" ||
+                  arg == "--autosave"      || arg == "-autosave") && i + 1 < argc) {
+            uint32_t v = 0;
+            if (!parse_uint32_arg(argv[++i], 1u, (1u << 20), v)) {
+                std::cerr << "Error: --autosavetimer must be in 1.." << (1u<<20) << " seconds\n";
+                return EXIT_FAILURE;
+            }
+            autosave_seconds = v;
         }
         else if ((arg == "--gpus" || arg == "-gpus") && i + 1 < argc) {
             gpu_list_str = argv[++i];
@@ -2108,7 +2138,7 @@ R"(  __  __ _   _ _  _____ ___ ______   ______ _     ___  _   _ _____
 
     if (range_hex.empty() || (target_hash_hex.empty() && address_b58.empty())) {
         std::cerr << "Usage: " << argv[0]
-                  << " --range <start_hex>:<end_hex> (--address <base58> | --target-hash160 <hash160_hex>) [--grid A,B] [--slices N] [--tpb THREADS] [--seconds N] [--gpus GPU1,GPU2,...] [--cpu-threads N|auto] [--cpu-percent P|auto] [--cpu-auto] [--cpu-bench-seconds N] [--cpu-exe PATH] [--max-launch-keys N] [--random-interval SECONDS] [--partial HEX_DIGITS] [--resume] [--checkpoint FILE] [--checkpoint-pass PASS]\n";
+                  << " --range <start_hex>:<end_hex> (--address <base58> | --target-hash160 <hash160_hex>) [--grid A,B] [--slices N] [--tpb THREADS] [--seconds N] [--gpus GPU1,GPU2,...] [--cpu-threads N|auto] [--cpu-percent P|auto] [--cpu-auto] [--cpu-bench-seconds N] [--cpu-exe PATH] [--max-launch-keys N] [--random-interval SECONDS] [--partial HEX_DIGITS] [--resume] [--checkpoint FILE] [--checkpoint-pass PASS] [--autosavetimer SECONDS]\n";
         return EXIT_FAILURE;
     }
     if (cpu_auto_percent && !cpu_threads_requested && !cpu_threads_auto_requested) {
@@ -2835,7 +2865,69 @@ R"(  __  __ _   _ _  _____ ___ ______   ______ _     ___  _   _ _____
     unsigned long long lastHashes = 0ull;
 
     bool stop_all = false;
+    double last_autosave_time = 0.0;
+    bool   autosave_failed_warned = false;
     bool time_limit_hit = false;
+
+    // Snapshot live GPU progress into a Checkpoint. Used both by --autosavetimer
+    // during the run and by the exit path, so the two can never drift apart.
+    //
+    // Deliberately does NOT synchronise the stream. The host queues launches
+    // ahead, so cudaStreamSynchronize here would drain the whole pipeline and
+    // stall the search for seconds at every autosave. The streams are created
+    // cudaStreamNonBlocking, so the plain cudaMemcpy below does not implicitly
+    // sync with them either -- it can read counters a running kernel is still
+    // decrementing. That is safe here because the read is only ever used
+    // conservatively: see the max_rem comment below.
+    auto capture_checkpoint = [&](Checkpoint& cp) -> bool {
+        copy256_host(range_start, cp.range_start);
+        copy256_host(orig_range_end, cp.range_end);
+        std::memcpy(cp.target_hash160, target_hash160, 20);
+        cp.batch_size        = runtime_points_batch_size;
+        cp.batches_per_sm    = runtime_batches_per_sm;
+        cp.slices            = slices_per_launch;
+        cp.threads_per_block = runtime_threads_per_block;
+        cp.hashes            = resume_hashes;
+        cp.cpu_tail          = cpu_range_arg;
+        cp.gpus.resize(numGPUs);
+
+        for (int gpuIdx = 0; gpuIdx < numGPUs; ++gpuIdx) {
+            GPUContext& gpu = gpus[gpuIdx];
+            cudaSetDevice(gpu.deviceId);
+
+            std::vector<uint64_t> counts((size_t)gpu.threadsTotal * 4u);
+            if (cudaMemcpy(counts.data(), gpu.d_counts256,
+                           gpu.threadsTotal * 4 * sizeof(uint64_t),
+                           cudaMemcpyDeviceToHost) != cudaSuccess) {
+                return false;
+            }
+            // The threads march in lockstep so these should all be equal, but
+            // take the largest rather than trusting that: resuming early only
+            // re-scans keys, whereas resuming late would skip them. This is
+            // also what makes the unsynchronised read above safe -- these
+            // counters only ever decrease, so a value read mid-flight is at
+            // worst stale, and the max over 11M threads is a lower bound on
+            // progress. A resume can therefore repeat work but never skip it.
+            uint64_t max_rem[4] = {0ull, 0ull, 0ull, 0ull};
+            for (uint64_t t = 0; t < gpu.threadsTotal; ++t) {
+                const uint64_t* r = &counts[(size_t)t * 4u];
+                if (lt256(max_rem, r)) { for (int k = 0; k < 4; ++k) max_rem[k] = r[k]; }
+            }
+
+            unsigned long long done_hashes = 0ull;
+            if (cudaMemcpy(&done_hashes, gpu.d_hashes_accum, sizeof(unsigned long long),
+                           cudaMemcpyDeviceToHost) == cudaSuccess) {
+                cp.hashes += done_hashes;
+            }
+
+            CheckpointGpu& g = cp.gpus[gpuIdx];
+            g.threads = gpu.threadsTotal;
+            copy256_host(gpu.range_start,    g.start);
+            copy256_host(gpu.per_thread_cnt, g.per_thread);
+            sub256(gpu.per_thread_cnt, max_rem, g.consumed);
+        }
+        return true;
+    };
     std::atomic<bool> found_any(false);
     std::vector<unsigned long long> gpuHashes(numGPUs, 0ull);
     std::vector<bool> gpuCompleted(numGPUs, false);
@@ -3340,6 +3432,34 @@ R"(  __  __ _   _ _  _____ ___ ______   ______ _     ___  _   _ _____
             stop_all = true;
             time_limit_hit = true;
         }
+        // --autosavetimer: periodically write the same checkpoint the exit path
+        // would, so a crash or a power cut costs at most one interval of work
+        // rather than the whole run. Random mode has no linear progress to
+        // record, and a run that already found the key is about to delete the
+        // checkpoint anyway, so neither autosaves.
+        if (autosave_seconds != 0 && !stop_all && !random_mode && !found_any.load() &&
+            elapsed_for_limit - last_autosave_time >= (double)autosave_seconds) {
+            last_autosave_time = elapsed_for_limit;
+            Checkpoint cp;
+            if (capture_checkpoint(cp) &&
+                write_checkpoint(checkpoint_path, cp, checkpoint_key)) {
+                long double cp_done  = ld_from_u256(cp.gpus[0].consumed);
+                long double cp_total = ld_from_u256(cp.gpus[0].per_thread);
+                std::cout << "\r\n[autosave] checkpoint written to " << checkpoint_path;
+                if (cp_total > 0.0L)
+                    std::cout << " at " << std::fixed << std::setprecision(2)
+                              << (double)(cp_done / cp_total * 100.0L) << "%";
+                std::cout << " (" << cp.hashes << " keys checked)\n";
+                std::cout.flush();
+                autosave_failed_warned = false;
+            } else if (!autosave_failed_warned) {
+                // Warn once per failure streak: a broken path would otherwise
+                // print every interval and bury the status line.
+                std::cerr << "\r\nWarning: autosave could not write checkpoint to "
+                          << checkpoint_path << "\n";
+                autosave_failed_warned = true;
+            }
+        }
         if (random_mode && !stop_all &&
             elapsed_for_limit - last_random_time >= (double)random_interval_seconds) {
             if (!rerandomize_all_gpus()) {
@@ -3464,50 +3584,7 @@ R"(  __  __ _   _ _  _____ ___ ______   ______ _     ___  _   _ _____
     const bool stopped_early = !found_any.load() && !random_mode && (g_sigint || time_limit_hit);
     if (stopped_early) {
         Checkpoint cp;
-        copy256_host(range_start, cp.range_start);
-        copy256_host(orig_range_end, cp.range_end);
-        std::memcpy(cp.target_hash160, target_hash160, 20);
-        cp.batch_size        = runtime_points_batch_size;
-        cp.batches_per_sm    = runtime_batches_per_sm;
-        cp.slices            = slices_per_launch;
-        cp.threads_per_block = runtime_threads_per_block;
-        cp.hashes            = resume_hashes;
-        cp.cpu_tail          = cpu_range_arg;
-        cp.gpus.resize(numGPUs);
-
-        bool ok = true;
-        for (int gpuIdx = 0; gpuIdx < numGPUs && ok; ++gpuIdx) {
-            GPUContext& gpu = gpus[gpuIdx];
-            cudaSetDevice(gpu.deviceId);
-
-            std::vector<uint64_t> counts((size_t)gpu.threadsTotal * 4u);
-            if (cudaMemcpy(counts.data(), gpu.d_counts256,
-                           gpu.threadsTotal * 4 * sizeof(uint64_t),
-                           cudaMemcpyDeviceToHost) != cudaSuccess) {
-                ok = false;
-                break;
-            }
-            // The threads march in lockstep so these should all be equal, but
-            // take the largest rather than trusting that: resuming early only
-            // re-scans keys, whereas resuming late would skip them.
-            uint64_t max_rem[4] = {0ull, 0ull, 0ull, 0ull};
-            for (uint64_t t = 0; t < gpu.threadsTotal; ++t) {
-                const uint64_t* r = &counts[(size_t)t * 4u];
-                if (lt256(max_rem, r)) { for (int k = 0; k < 4; ++k) max_rem[k] = r[k]; }
-            }
-
-            unsigned long long done_hashes = 0ull;
-            if (cudaMemcpy(&done_hashes, gpu.d_hashes_accum, sizeof(unsigned long long),
-                           cudaMemcpyDeviceToHost) == cudaSuccess) {
-                cp.hashes += done_hashes;
-            }
-
-            CheckpointGpu& g = cp.gpus[gpuIdx];
-            g.threads = gpu.threadsTotal;
-            copy256_host(gpu.range_start,    g.start);
-            copy256_host(gpu.per_thread_cnt, g.per_thread);
-            sub256(gpu.per_thread_cnt, max_rem, g.consumed);
-        }
+        const bool ok = capture_checkpoint(cp);
 
         if (ok && write_checkpoint(checkpoint_path, cp, checkpoint_key)) {
             long double cp_done  = ld_from_u256(cp.gpus[0].consumed);

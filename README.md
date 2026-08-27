@@ -75,7 +75,7 @@ integration quirk, not a problem with this project. Add the toolset selector:
 CUDACyclone --range <start_hex>:<end_hex>
             (--address <base58> | --target-hash160 <40 hex digits>)
             [--grid A,B] [--slices N] [--tpb N] [--gpus 0,1] [--seconds N]
-            [--resume] [--checkpoint FILE]
+            [--resume] [--checkpoint FILE] [--autosavetimer SECONDS]
 ```
 
 `--grid A,B` sets *A* = keys per batch per thread, *B* = batches per SM.
@@ -133,6 +133,34 @@ searching the wrong keys:
 Error: checkpoint 'cyclone_checkpoint.txt' does not match this run:
   - slices: checkpoint 8, now 16
 ```
+
+#### Autosaving while the run continues
+
+Ctrl+C and `--seconds` both exit cleanly, so they get a chance to save. A crash,
+a power cut, or `kill -9` does not — and on a long search that loses everything
+since the run started. **`--autosavetimer SECONDS`** rewrites the same
+checkpoint every *N* seconds while the search keeps going, capping what a hard
+stop can cost you at one interval:
+
+```
+CUDACyclone --range AAAA:BBBB --address 1Abc... --autosavetimer 300
+[autosave] checkpoint written to cyclone_checkpoint.txt at 12.04% (48318382080 keys checked)
+```
+
+Recovery is the ordinary `--resume` path — an autosaved file is the same format
+the exit path writes, encrypted the same way, and resumable by the same command.
+
+The save is cheap: it copies the per-thread counters and writes a small file,
+without draining the GPU pipeline, so the search does not pause while it runs.
+The counters are read while kernels are still running, which is deliberately
+safe — they only ever count down, so a mid-flight read understates progress and
+a resume repeats a little work rather than skipping any. The file is written to
+`<checkpoint>.tmp` and renamed over the target, so a crash *during* an autosave
+cannot truncate the previous good checkpoint.
+
+Pick the interval to match what you are protecting against; `300` (5 min) is a
+reasonable default for an overnight run. `--autosavetimer` is ignored in random
+mode, which has no linear progress to record.
 
 Resuming is chainable — stop and resume as many times as you like. The
 checkpoint is deleted once the range is finished or the key is found, so a
