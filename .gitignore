@@ -16,6 +16,9 @@ build-fix/
 /CUDACyclone.exe
 bin-windows/CUDACyclone.exe
 bin-linux/CUDACyclone
+# versioned release artifacts, uploaded to the GitHub release not committed
+bin-windows/CUDACyclone-v*.exe
+bin-linux/CUDACyclone-v*
 
 # local working backups
 *.bak_*

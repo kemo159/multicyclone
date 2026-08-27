@@ -20,3 +20,10 @@ Also supports checkpoint/resume: a run stopped with Ctrl+C or --seconds writes
 cyclone_checkpoint.txt, and re-running the same command with --resume continues
 from there. --resume refuses to run unless the target, --range, --grid, --slices,
 --tpb and GPU set all match what the checkpoint was written under.
+
+New in v3.1: --autosavetimer SECONDS rewrites the checkpoint every N seconds
+while the search keeps running, so a crash, a power cut or kill -9 costs at most
+one interval instead of the whole run. Ctrl+C and --seconds already saved on the
+way out; this covers the stops that never get the chance. Recovery is the same
+--resume path, and the checkpoint is written to a temp file and renamed over the
+target so a crash mid-save cannot truncate the previous good one.
