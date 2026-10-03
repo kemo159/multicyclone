@@ -1642,12 +1642,12 @@ void Int::Check() {
   a.Rand(pSize);
   b.Rand(pSize-64);
   t0 = Timer::get_tick();
-  uint64_t c0 = my_rdtsc();
+  uint64_t c0 = __rdtsc();
   for (int i = 0; i < 400000; i++) {
     a.Add(&b);
     a.ModInv();
   }
-  uint64_t c1 = my_rdtsc();
+  uint64_t c1 = __rdtsc();
   t1 = Timer::get_tick();
 
   printf("ModInv() Results OK : ");
