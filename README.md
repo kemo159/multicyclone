@@ -82,6 +82,34 @@ CUDACyclone --range <start_hex>:<end_hex>
 **`--grid 512,512` is the tuned default** and what every number here was
 measured at. `A=512` alone is worth +7.25% over the old default of 128.
 
+### Flag reference
+
+One of `--address` or `--target-hash160` is required, plus `--range`. Everything
+else has a working default.
+
+| Flag | Default | Explanation | Example |
+|---|---|---|---|
+| `--range START:END` | *(required)* | Inclusive hex interval to search, no `0x` prefix. | `--range 400000000:7FFFFFFFF` |
+| `--address BASE58` | — | P2PKH target address. Mutually exclusive with `--target-hash160`. | `--address 1Abc...` |
+| `--target-hash160 HEX` | — | Target as a 40-hex-digit HASH160 instead of an address. | `--target-hash160 62e907b1...` |
+| `--grid A,B` | `512,512` | *A* = keys per batch per thread, *B* = batches per SM. Tuned once per GPU generation; see the `--grid` note above. | `--grid 512,512` |
+| `--slices N` | `1` | Batches per kernel launch, as a multiple of `--grid`'s *A*. Raising it reduces launch overhead on large sweeps at the cost of less frequent progress updates and slower Ctrl+C response. | `--slices 8` |
+| `--tpb N` | — | Threads per block; must be a multiple of 32 in `32..256`. Leave unset unless you have a measured reason to change it. | `--tpb 256` |
+| `--max-launch-keys N` | `6000000000` | Caps keys per kernel launch, splitting a huge sweep into several launches so one call can't run long enough to trip a driver timeout or stall Ctrl+C. `0` disables the cap. | `--max-launch-keys 6000000000` |
+| `--gpus LIST` | all GPUs | Comma-separated CUDA device indices to use. Omit to use every visible GPU. | `--gpus 0,1` |
+| `--seconds N` | run to completion | Stop after *N* seconds (exit code 2) and write a checkpoint, even if the range isn't exhausted. | `--seconds 3600` |
+| `--resume` | off | Continue from `cyclone_checkpoint.txt` (or `--checkpoint`'s file). Requires the exact same target, `--range`, `--grid`, `--slices`, `--tpb`, and GPU set as the run that wrote it. | `--resume` |
+| `--checkpoint FILE` | `cyclone_checkpoint.txt` | Checkpoint path, for both writing and `--resume`. | `--checkpoint run1.ckpt` |
+| `--checkpoint-pass PASS` | none | Passphrase mixed into the checkpoint's encryption key. Prefer the `CUDACYCLONE_CHECKPOINT_PASS` environment variable over this flag — the flag is visible in `ps`/Task Manager. | `--checkpoint-pass "correct horse"` |
+| `--autosavetimer SECONDS` | off | Rewrite the checkpoint every *N* seconds while the search runs, so a crash or `kill -9` costs at most one interval. Ignored with `--random-interval`. | `--autosavetimer 300` |
+| `--cpu-threads N\|auto` | off (no CPU sidecar) | Give the CPU a sidecar slice of the range (see below). `auto` uses all logical cores but one. | `--cpu-threads 24` |
+| `--cpu-percent P\|auto` | `5` | Percent of the *total* range handed to the CPU sidecar. `auto`/`--cpu-auto` benchmarks both sides first and picks a split that finishes together. | `--cpu-percent auto` |
+| `--cpu-auto` | off | Shorthand for `--cpu-percent auto` plus `--cpu-threads auto` when neither is set explicitly. | `--cpu-auto` |
+| `--cpu-bench-seconds N` | `3` | How long the one-time GPU/CPU benchmark runs when `--cpu-auto`/`--cpu-percent auto` is used. | `--cpu-bench-seconds 5` |
+| `--cpu-exe PATH` | this binary, re-invoked with `--cpu-worker` | Use a different executable as the CPU sidecar instead of the embedded worker. See the sidecar protocol below if you build your own. | `--cpu-exe cpu_avx2\Cyclone.exe` |
+| `--random-interval SECONDS` | off (linear sweep) | Instead of sweeping the range in order, resample a fresh random sub-interval every *N* seconds. No linear progress, so `--resume`/`--autosavetimer` don't apply. GPU-only — see the sidecar protocol note below for why the CPU worker doesn't need this. | `--random-interval 30` |
+| `--partial HEXDIGITS` | off | Also log *partial* HASH160 matches (first *N* hex digits, `1..40`) to `partial.txt`, not just exact matches. Useful for sanity-checking a search is actually computing real candidates. | `--partial 8` |
+
 ### Stopping and resuming
 
 A run stopped with **Ctrl+C** or by **`--seconds`** writes its progress to
@@ -196,6 +224,34 @@ second at GPU speed.
 the split so they finish together, which avoids the wasted CPU effort in the
 first place. The takeover is the safety net for when a one-time benchmark drifts
 (thermal throttling, other load on the box) or when you set the percentage by hand.
+
+### Writing a custom `--cpu-exe` sidecar
+
+`--cpu-exe PATH` lets you swap in a different CPU search binary instead of the
+embedded worker — the same way `CUDACyclone.exe` invokes *itself* with
+`--cpu-worker` when you don't pass `--cpu-exe` at all. Whatever binary you give
+it is spawned once per run with a fixed slice of the range and must implement
+this interface:
+
+| Flag | Required | Explanation | Example |
+|---|---|---|---|
+| `-a BASE58` | yes | P2PKH target address for this run. | `-a 1Abc...` |
+| `-r START:END` | yes | The sidecar's assigned sub-range in hex, inclusive. Set fresh by the parent process every run — see the note below. | `-r 400000000:7FFFFFFFF` |
+| `-t N` | no | Thread count. Omit to use all logical cores. | `-t 24` |
+| `--stats-file PATH` | no | Write progress as `KEY=value` lines (`CPU_THREADS`, `CPU_MKEYS`, `CPU_CHECKED`, `CPU_ELAPSED`, `CPU_PROGRESS`, `CPU_DONE`, `CPU_FOUND`) so the parent can poll it without parsing stdout. | `--stats-file cpu_worker.stats` |
+| `--quiet` | no | Suppress the human-readable progress block; still writes `--stats-file` and `found_keys.txt`. | `--quiet` |
+| `--bench-seconds N` | no | Run for exactly *N* seconds and report a throughput benchmark instead of searching for a match — used by `--cpu-auto`'s tuning pass. | `--bench-seconds 3` |
+
+On a match, write one line to `found_keys.txt` in the working directory:
+`<64-hex privkey> <66-hex compressed pubkey> <WIF> <address>`. The parent polls
+that file's size rather than scraping stdout.
+
+There is deliberately no random-search flag in this interface. `CUDACyclone.exe`
+owns range assignment end to end: every time it gives the sidecar work, it's a
+fresh `-r START:END` picked by the parent (including on the GPU-takeover and
+`--random-interval` paths above). A custom sidecar never needs to pick its own
+sub-range or reseed itself — it only ever searches exactly the interval it was
+just handed, linearly, and reports back.
 
 ### Exit codes
 
