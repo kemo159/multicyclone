@@ -19,3 +19,16 @@ one interval instead of the whole run. Ctrl+C and --seconds already saved on the
 way out; this covers the stops that never get the chance. Recovery is the same
 --resume path, and the checkpoint is written to a temp file and renamed over the
 target so a crash mid-save cannot truncate the previous good one.
+
+New in v3.2: fixed four correctness bugs in the AVX2 CPU worker (cpu_avx2/Cyclone.cpp,
+used by --cpu-auto/--cpu-percent and the standalone CPU build). (1) A batch's center
+key (offset 0, and offset 255 whenever that key is <= 255) hit an out-of-bounds
+GTable read / point-doubling degeneracy in the chord-addition shortcut and was
+silently skipped instead of checked. (2) The last batch of each thread's range
+could stop up to 254 keys short of the requested end instead of covering it fully.
+(3) An accepted match was never checked against the overall requested range, so a
+batch's +/-255 spread could report a key technically outside --range. (4) The
+degenerate-slot placeholder point could coincide with a real target hash and get
+reported as a false positive, overwriting an already-found correct result. All four
+were found by an exhaustive coverage audit (2,734 cases, 0 misses/errors after the
+fix) and do not affect the GPU-side search path.

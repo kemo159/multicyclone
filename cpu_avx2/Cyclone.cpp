@@ -576,6 +576,13 @@ int main(int argc, char* argv[])
     Int i512; i512.SetInt32(510);
     Point big512G=secp.ComputePublicKey(&i512);
 
+    // The ±255 batch spread can produce a candidate key just outside the
+    // requested [startHex, endHex] interval at the very first/last batch of
+    // the whole search. Bound any accepted match against these, not just the
+    // per-thread sub-range.
+    const Int overallRangeStart = hexToInt(startHex);
+    const Int overallRangeEnd = hexToInt(endHex);
+
 
 #pragma omp parallel num_threads(numCPUs) \
     shared(globalChecked,globalElapsed,mkeys,matchFound,timeExpired, \
@@ -612,14 +619,51 @@ int main(int argc, char* argv[])
             jumpInt = hexToInt(oss.str());
         }
 
+        // Becomes true once a processed batch's [-255,+255] window has already
+        // reached through privEnd. Checked at loop entry rather than comparing the
+        // next center against privEnd directly, because batches are spaced exactly
+        // 510 apart with a 511-wide window (centers touch, no gap) - but privEnd is
+        // not generally a multiple of 510 away from the thread's start, so stopping
+        // as soon as the center alone exceeds the end leaves the final partial
+        // stretch of the range (up to 254 keys) unchecked.
+        bool threadRangeFullyCovered = false;
+
         while(!matchFound && !timeExpired){
-            if(intGreater(priv,privEnd)) break;
+            if(threadRangeFullyCovered) break;
 
 #pragma omp critical
             g_threadPrivateKeys[tid]=padHexTo64(intToHex(priv));
 
             for(int i=0;i<POINTS_BATCH_SIZE;++i){
                 deltaX[i].ModSub(&plus[i].x,&base.x);
+            }
+            // Two cases make the shared-inversion chord-addition formula below invalid
+            // for a given index i:
+            //  - i == 0: offset 0 is the batch center itself (priv+0). 0*G is the point
+            //    at infinity, which plus[0]/minus[0] cannot correctly represent (the
+            //    GTable lookup for a zero scalar reads past the table, returning
+            //    garbage) - always treated as degenerate, regardless of its value.
+            //  - i == priv (only reachable when the batch center is itself
+            //    <= POINTS_BATCH_SIZE-1, i.e. within ~255 of absolute scalar 0 - never
+            //    the case for a real puzzle-sized range, but reachable for small test
+            //    ranges): plus[i].x equals base.x exactly, since both are i*G. The plus
+            //    side needs a point-doubling (2*i*G) and the minus side needs the point
+            //    at infinity (i*G - i*G) - neither representable by the generic chord
+            //    formula, which assumes distinct, non-inverse operands.
+            // A single zero in the shared batch product also poisons every later
+            // index's recovered inverse via Montgomery's trick, so these must be
+            // neutralized before modGrp.ModInv() runs, not just patched up afterward.
+            std::array<bool, POINTS_BATCH_SIZE> degenerate{};
+            degenerate[0] = true;
+            for (int i = 1; i < POINTS_BATCH_SIZE; i++) {
+                if (deltaX[i].IsZero()) degenerate[i] = true;
+            }
+            std::array<bool, POINTS_BATCH_SIZE> minusSlotInvalid{};
+            {
+                Int placeholder; placeholder.SetInt32(1);
+                for (int i = 0; i < POINTS_BATCH_SIZE; i++) {
+                    if (degenerate[i]) deltaX[i].Set(&placeholder);
+                }
             }
             modGrp.Set(deltaX.data()); modGrp.ModInv();
 
@@ -644,6 +688,31 @@ int main(int argc, char* argv[])
                 Int dx; dx.Set(&base.x); dx.ModSub(&r.x); dx.ModMulK1(&k);
                 r.y.ModNeg(); r.y.ModAdd(&dx);
                 ptBatch[POINTS_BATCH_SIZE+i]=r;
+            }
+
+            // Recompute every degenerate index directly instead of trusting the generic
+            // chord-addition formula above, which used a placeholder deltaX[i] and so
+            // produced a meaningless result at these positions in both loops.
+            for (int i = 0; i < POINTS_BATCH_SIZE; i++) {
+                if (!degenerate[i]) continue;
+                Int plusKey; plusKey.Set(&priv);
+                Int offsetInt; offsetInt.SetInt32(i);
+                plusKey.Add(&offsetInt);
+                ptBatch[i] = secp.ComputePublicKey(&plusKey);
+
+                // The actual point stored here doesn't matter for i > 0 (base is just a
+                // convenient, already-available value) - what matters is that
+                // minusSlotInvalid[i] is set, which unconditionally rejects any match
+                // reported against this slot below, regardless of what its hash160
+                // happens to be. This slot must still hold *some* valid point and stay
+                // in the batch (rather than being skipped) so every batch keeps
+                // contributing exactly fullBatch candidates: skipping entries here would
+                // make batches a non-multiple of HASH_BATCH_SIZE, causing a partial
+                // carryover into the next outer-loop iteration's buffer - whose idxArr
+                // would then be misread against the next iteration's already-overwritten
+                // ptBatch/priv.
+                ptBatch[POINTS_BATCH_SIZE + i] = base;
+                if (i != 0) minusSlotInvalid[i] = true;
             }
 
             unsigned int pendingJumps=0;
@@ -681,9 +750,10 @@ int main(int argc, char* argv[])
                                     (targetHash160[prefBytes] & 0xF0))
                                     prefixOK=false;
                             }
+                            int idx=idxArr[j];
+                            if(idx >= 256 && minusSlotInvalid[idx - 256]) prefixOK=false;
                             if(prefixOK){
                                 Int cPriv=priv;
-                                int idx=idxArr[j];
                                 if(idx<256){ Int off; off.SetInt32(idx); cPriv.Add(&off); }
                                 else       { Int off; off.SetInt32(idx-256); cPriv.Sub(&off); }
 
@@ -697,14 +767,26 @@ int main(int argc, char* argv[])
                         }
 
                         if(!benchmarkMode && std::memcmp(cand,targetHash160.data(),20)==0){
+                            int idx=idxArr[j];
+                            // This slot has no valid point to check at all (see
+                            // minusSlotInvalid above) - its hash160 is whatever base's
+                            // happens to be, purely as filler, and must never be
+                            // accepted as a match no matter what it equals.
+                            const bool validSlot = !(idx >= 256 && minusSlotInvalid[idx - 256]);
+                            Int mPriv=priv;
+                            if(idx<256){ Int off; off.SetInt32(idx); mPriv.Add(&off); }
+                            else       { Int off; off.SetInt32(idx-256); mPriv.Sub(&off); }
+                            // The ±255 batch spread can generate a real secp256k1 match
+                            // just outside the declared interval at the very first/last
+                            // batch of the whole search - verify it actually falls
+                            // within the requested range before accepting it.
+                            const bool inRange = validSlot
+                                               && !intGreater(overallRangeStart, mPriv)
+                                               && !intGreater(mPriv, overallRangeEnd);
 #pragma omp critical(full_match)
                             {
-                                if(!matchFound){
+                                if(!matchFound && inRange){
                                     matchFound=true;
-                                    Int mPriv=priv;
-                                    int idx=idxArr[j];
-                                    if(idx<256){ Int off; off.SetInt32(idx); mPriv.Add(&off); }
-                                    else       { Int off; off.SetInt32(idx-256); mPriv.Sub(&off); }
                                     foundPriv=padHexTo64(intToHex(mPriv));
                                     foundPub=pointToCompressedHex(ptBatch[idx]);
                                     foundWIF=P2PKHDecoder::compute_wif(foundPriv,true);
@@ -738,6 +820,14 @@ int main(int argc, char* argv[])
             }
 
             {
+                // Did this batch's window already reach through the end of this
+                // thread's declared range? If so, there is no further tail left to
+                // cover and the loop should stop after this iteration.
+                Int batchReach; batchReach.Set(&priv);
+                Int halfWidth; halfWidth.SetInt32(POINTS_BATCH_SIZE - 1); // 255
+                batchReach.Add(&halfWidth);
+                threadRangeFullyCovered = !intGreater(privEnd, batchReach);
+
                 Int step; step.SetInt32(fullBatch-2);
                 priv.Add(&step);
                 base=secp.AddDirect(base,big512G);
